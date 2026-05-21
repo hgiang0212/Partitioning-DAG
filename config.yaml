@@ -2,19 +2,19 @@ name: YOLO
 server:
   cut-layer: a # or b, c, d
   clients:
-    - 1
-    - 1
+    - 2
+    - 2
   model: yolo26n
-  batch-size: 4
+  batch-size: 32
 rabbit:
   address: 127.0.0.1
-  username: admin
-  password: admin
+  username: guest
+  password: guest
   virtual-host: /
 
 debug-mode: False
 data: video.mp4
 log-path: .
 compress:
-  enable: False
+  enable: True
   num_bit: 8
