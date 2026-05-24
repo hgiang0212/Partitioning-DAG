@@ -1,0 +1,26 @@
+name: YOLO
+server:
+  cut-layer: b
+  clients:
+    - 2
+    - 2
+  model: yolo26n
+  batch-size: 32
+
+rabbit:
+  address: 127.0.0.1
+  username: guest
+  password: guest
+  virtual-host: /
+
+pdd:
+  enabled: true
+  profiles_path: devices.json              # file chứa layer_times + bandwidth đã đo
+  inter_cloud_bandwidth_MBps: 125.0         # BW giữa các cloud node (1 Gbps LAN)
+
+debug-mode: False
+data: video.mp4
+log-path: .
+compress:
+  enable: True
+  num_bit: 8
