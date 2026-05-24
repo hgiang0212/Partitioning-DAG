@@ -2,7 +2,7 @@ import numpy as np
 from dataclasses import dataclass
 from typing import List, Tuple, Optional
 import src.Log as Log
-
+from collections import Counter
 
 
 DEFAULT_RAW_INPUT_MB = 13.0
@@ -13,10 +13,6 @@ DEFAULT_CUT_DATA_SIZES_MB = np.array([
     10.87,  9.57, 10.27, 10.25,  9.42,
 ], dtype=float)   # length = num_layers - 1 = 23
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 1. Build activation-size vector
-# ─────────────────────────────────────────────────────────────────────────────
 
 def build_activation_sizes(
     raw_input_mb: float,
@@ -37,10 +33,6 @@ def build_activation_sizes(
         )
     return np.concatenate([[raw_input_mb], cut_data_sizes_mb, [0.0]])
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 2. Cloud speed abstraction
-# ─────────────────────────────────────────────────────────────────────────────
 
 def estimate_work_and_cloud_speeds(
     cloud_layer_time: np.ndarray,
@@ -147,10 +139,6 @@ def _bpa(
     return best
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 4. GRB – Grouping Recursion with BPA
-# ─────────────────────────────────────────────────────────────────────────────
-
 def _pdd_grb(
     work: np.ndarray,
     speeds: np.ndarray,
@@ -193,10 +181,6 @@ def _first_cloud_of_plan(segments: List[Tuple[int, int, int]]):
         return None
     return min(non_empty, key=lambda x: x[1])[0]
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 5. Per-client PDD optimisation
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _evaluate_for_one_client(
     client_layer_time: np.ndarray,
@@ -359,26 +343,20 @@ def run_pdd_multi_client(
             "cyan",
         )
 
-    # Global cut: majority vote among per-client optimal cuts, tie-break by median ATD
-    from collections import Counter
     cut_votes = [r["local_cut"] for r in per_client]
-    vote_counts = Counter(cut_votes)
-    global_cut = vote_counts.most_common(1)[0][0]
 
     atds = np.array([r["atd"] for r in per_client])
     fpss = 1.0 / np.maximum(atds, 1e-12)
 
     Log.print_with_color(
-        f"[PDD] global_cut={global_cut} | "
         f"mean_atd={np.mean(atds)*1000:.1f}ms | "
         f"p95_atd={np.percentile(atds,95)*1000:.1f}ms | "
         f"system_fps={1.0/float(np.max(atds)):.1f}",
         "green",
     )
-
     return dict(
-        global_cut=global_cut,
         per_client=per_client,
+        per_client_cuts=[r["local_cut"] for r in per_client],
         mean_atd=float(np.mean(atds)),
         p95_atd=float(np.percentile(atds, 95)),
         max_atd=float(np.max(atds)),
@@ -394,7 +372,7 @@ def evaluate_pdd_multi_client(
         bandwidth_client_cloud_MBps: np.ndarray,
         inter_cloud_bandwidth_MBps: float,
         shared_cloud_contention: bool = True,
-) -> dict:
+):
     """
     Đánh giá PDD-GRB cho N clients và M cloud nodes.
 

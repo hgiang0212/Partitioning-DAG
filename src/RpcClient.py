@@ -1,85 +1,78 @@
-"""
-RpcClient – không thay đổi giao thức, chỉ xử lý START và STOP.
-Không còn pha PROFILE vì devices.json đã có sẵn ở server.
-"""
-
-import os
 import pickle
 import time
 import base64
+import os
 
 import torch
 import src.Log as Log
 
-
 class RpcClient:
-    def __init__(self, client_id, layer_id, channel, logger, inference_func, device):
-        self.client_id      = client_id
-        self.layer_id       = layer_id
-        self.logger         = logger
+    def __init__(self, client_id, layer_id, channel, logger ,inference_func, device):
+        self.client_id = client_id
+        self.layer_id = layer_id
+        self.logger = logger
         self.inference_func = inference_func
-        self.device         = device
-        self.channel        = channel
+        self.device = device
+
+        self.channel = channel
+        self.response = None
 
     def wait_response(self):
-        running = True
-        reply_q = f"reply_{self.client_id}"
-        self.channel.queue_declare(reply_q, durable=False)
-        while running:
-            method, _header, body = self.channel.basic_get(queue=reply_q, auto_ack=True)
+        status = True
+        reply_queue_name = f"reply_{self.client_id}"
+        self.channel.queue_declare(reply_queue_name, durable=False)
+        while status:
+            method_frame, header_frame, body = self.channel.basic_get(queue=reply_queue_name, auto_ack=True)
             if body:
-                running = self._dispatch(body)
+                status = self.response_message(body)
             time.sleep(0.5)
 
-    def _dispatch(self, body: bytes) -> bool:
-        msg    = pickle.loads(body)
-        action = msg.get("action", "")
-        Log.print_with_color(
-            f"[<<<] {action} – {msg.get('message', '')}", "blue"
-        )
+    def response_message(self, body):
+        self.response = pickle.loads(body)
+        Log.print_with_color(f"[<<<] Client received: {self.response['message']}", "blue")
+        action = self.response["action"]
 
         if action == "START":
-            self._handle_start(msg)
+            model_name = self.response["model_name"]
+            num_layers = self.response["num_layers"]
+            splits = self.response["splits"]
+            batch_size = self.response["batch_size"]
+            model = self.response["model"]
+            data = self.response["data"]
+            compress = self.response["compress"]
+
+            if model is not None:
+                file_path = f'{model_name}.pt'
+                if os.path.exists(file_path):
+                    Log.print_with_color(f"Exist {model_name}.pt", "green")
+                else:
+                    decoder = base64.b64decode(model)
+                    with open(f"{model_name}.pt", "wb") as f:
+                        f.write(decoder)
+                    Log.print_with_color(f"Loaded {model_name}.pt", "green")
+            else:
+                Log.print_with_color(f"Can't load model.", "yellow")
+
+            ckpt = torch.load("yolo26n.pt", map_location=self.device, weights_only=False)
+            model = ckpt["model"].to(self.device)
+            model = model.float()
+            layers = model.model
+            if self.layer_id == 1:
+                client = layers[:splits]
+            else:
+                client = layers[splits:]
+
+            Log.print_with_color(f"Start Inference", "green")
+
+            self.inference_func(client, data, num_layers, splits, batch_size, self.logger, compress)
+
+            return False
+        else:
             return False
 
-        # STOP hoặc action không xác định
-        Log.print_with_color("[>>>] Stopping.", "red")
-        return False
+    def send_to_server(self, message):
 
-    def _handle_start(self, msg: dict):
-        model_name = msg["model_name"]
-        num_layers = msg["num_layers"]
-        splits     = msg["splits"]
-        batch_size = msg["batch_size"]
-        model_b64  = msg["model"]
-        data       = msg["data"]
-        compress   = msg["compress"]
-
-        pt_path = f"{model_name}.pt"
-        if not os.path.exists(pt_path):
-            with open(pt_path, "wb") as f:
-                f.write(base64.b64decode(model_b64))
-            Log.print_with_color(f"[Start] Saved {pt_path}", "green")
-        else:
-            Log.print_with_color(f"[Start] Using {pt_path}", "green")
-
-        ckpt   = torch.load(pt_path, map_location=self.device, weights_only=False)
-        model  = ckpt["model"].to(self.device).float()
-        layers = model.model
-
-        client_layers = layers[:splits] if self.layer_id == 1 else layers[splits:]
-
-        Log.print_with_color(
-            f"[Start] layer_id={self.layer_id} | splits={splits} | "
-            f"{len(list(client_layers))} layers on {self.device}",
-            "green",
-        )
-        self.inference_func(
-            client_layers, data, num_layers, splits, batch_size, self.logger, compress
-        )
-
-    def send_to_server(self, message: dict):
-        self.channel.queue_declare("rpc_queue", durable=False)
-        self.channel.basic_publish(
-            exchange="", routing_key="rpc_queue", body=pickle.dumps(message)
-        )
+        self.channel.queue_declare('rpc_queue', durable=False)
+        self.channel.basic_publish(exchange='',
+                                   routing_key='rpc_queue',
+                                   body=pickle.dumps(message))
