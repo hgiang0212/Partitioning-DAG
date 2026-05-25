@@ -343,8 +343,6 @@ def run_pdd_multi_client(
             "cyan",
         )
 
-    cut_votes = [r["local_cut"] for r in per_client]
-
     atds = np.array([r["atd"] for r in per_client])
     fpss = 1.0 / np.maximum(atds, 1e-12)
 
@@ -411,7 +409,7 @@ def evaluate_pdd_multi_client(
 
     latencies = np.array([r["atd"] for r in per_client_results], dtype=float)
 
-    # ── Independent mode (không chia sẻ cloud) ────────────────────────────
+    # Independent mode
     if not shared_cloud_contention:
         round_time = float(np.max(latencies))
         return {
@@ -425,7 +423,7 @@ def evaluate_pdd_multi_client(
             "mean_client_fps": float(np.mean(1.0 / np.maximum(latencies, 1e-12))),
         }
 
-    # ── Shared-cloud contention mode ─────────────────────────────────────
+    # Shared-cloud contention mode
     cloud_loads = np.zeros(num_clouds, dtype=float)
     local_loads = np.zeros(num_clients, dtype=float)
     upload_times = np.zeros(num_clients, dtype=float)
