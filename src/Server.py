@@ -10,12 +10,11 @@ import pika
 from ultralytics import YOLO
 
 import src.Log
-from src.PDD import run_pdd_single_client, run_pdd_multi_client
+from src.PDD import evaluate_pdd_for_one_client
 
 
 class Server:
     def __init__(self, config):
-        # ── RabbitMQ ──────────────────────────────────────────────────────
         self.address      = config["rabbit"]["address"]
         self.username     = config["rabbit"]["username"]
         self.password     = config["rabbit"]["password"]
@@ -46,7 +45,8 @@ class Server:
         # PDD config
         self.pdd = config["pdd"]["enabled"]
         self.inter_cloud_bw = config["pdd"]["inter_cloud_bandwidth_MBps"]
-        self.profiles_path = config["pdd"]["profiles_path"]
+        self.devices_path = config["profile"]["devices_path"]
+        self.layer_profile_path = config["profile"]["layer_profile_path"]
 
         log_path = config["log-path"]
         self.logger = src.Log.Logger(f"{log_path}/app.log", config["debug-mode"])
@@ -106,7 +106,7 @@ class Server:
                 src.Log.print_with_color(f"Download {self.model_name}", "yellow")
                 _ = YOLO(f"{self.model_name}.pt")
 
-            per_client_splits = self._compute_splits_from_profiles()
+            splits = self._compute_splits_from_profiles()
 
             file_path = f"{self.model_name}.pt"
             if os.path.exists(file_path):
@@ -120,7 +120,7 @@ class Server:
 
             for (client_id, layer_id) in self.list_clients:
                 # Use per-client split if available, else use a default
-                client_split = per_client_splits.get(str(client_id), per_client_splits.get("default", 11))
+                client_split = split.get(str(client_id), per_client_splits.get("default", 11))
 
                 response = {"action": "START",
                             "message": "Server accept the connection",
@@ -150,33 +150,31 @@ class Server:
         if not self.pdd:
             return static_cut
         try:
-            with open(self.profiles_path, "r", encoding="utf-8") as f:
-                profiles = json.load(f)
+            with open(self.devices_path, "r", encoding="utf-8") as f:
+                devices_profile = json.load(f)
+            with open(self.layer_profile_path, "r", encoding="utf-8") as f:
+                layer_profile = json.load(f)
         except Exception as e:
             src.Log.print_with_color(f"[PDD] Đọc profiles thất bại: {e}", "red")
             return static_cut
 
         # Cloud layer times
-        cloud_lt = np.asarray(profiles["cloud"]["layer_times"], dtype=float)
-        num_layers = len(cloud_lt)
-        cloud_layer_time = cloud_lt.reshape(1, -1)  # shape [1, K] – 1 cloud server
+        cloud_cap = np.asarray(devices_profile["cloud"]["compute_capacity_gflops"], dtype=float)
+        num_layers = len(cloud_cap)
+        cloud_compute = cloud_cap.reshape(1, -1)
 
         # Edge clients
-        edge_clients = [c for c in profiles["clients"] if c.get("layer_id", 1) == 1]
+        edge_clients = devices_profile["clients"]
         if not edge_clients:
             src.Log.print_with_color(
                 "[PDD] Không có edge client trong profiles – dùng static cut", "red"
             )
             return static_cut
 
-        client_layer_times = np.vstack(
-            [np.asarray(c["layer_times"], dtype=float) for c in edge_clients]
-        )  # shape [N, K]
+        client_compute = np.asarray(edge_clients["compute_capacity_gflops"] , dtype= float)
+        all_cu_flops = np.vstack([client_compute,cloud_compute])
 
-        # bandwidth mỗi edge → cloud, shape [N, 1]
-        bandwidths = np.array(
-            [c.get("bandwidth_MBps", 50.0) for c in edge_clients]
-        ).reshape(-1, 1)
+        bandwidths = edge_clients["bandwidth_mbps"]
 
         # In thông tin thiết bị
         src.Log.print_with_color(
@@ -184,42 +182,21 @@ class Server:
             f"bw={bandwidths.flatten().tolist()} MB/s",
             "cyan",
         )
-        for c in edge_clients:
-            t = np.asarray(c["layer_times"]).sum()
-            src.Log.print_with_color(
-                f"      {c.get('device_type', c['client_id'])} | "
-                f"total={t * 1000:.1f}ms | bw={c.get('bandwidth_MBps', 50):.0f}MB/s",
-                "cyan",
-            )
 
+        layer_gflops = np.asarray(layer_profile["layer_gflops"], dtype= float)
+        CUT_DATA_SIZES_MB = np.asarray(layer_profile["CUT_DATA_SIZES_MB"], dtype= float)
+        activation_mb = np.concatenate([[13.0], CUT_DATA_SIZES_MB, [0.0]])
         # Chạy PDD
         try:
-            if len(edge_clients) == 1:
-                result = run_pdd_single_client(
-                    client_layer_time=client_layer_times[0],
-                    cloud_layer_time=cloud_layer_time,
-                    client_to_cloud_bandwidth_MBps=bandwidths[0],
-                    inter_cloud_bandwidth_MBps=self.inter_cloud_bw,
-                )
-                optimal_cut = int(result["local_cut"])
-                # Map client_id to their optimal cut
-                client_id = edge_clients[0].get("client_id", "0")
-                return {str(client_id): optimal_cut, "default": optimal_cut}
-            else:
-                result = run_pdd_multi_client(
-                    client_layer_times=client_layer_times,
-                    cloud_layer_time=cloud_layer_time,
-                    bandwidth_client_cloud_MBps=bandwidths,
-                    inter_cloud_bandwidth_MBps=self.inter_cloud_bw,
-                )
-                
-                per_client_cuts = {}
-                for i, client_info in enumerate(edge_clients):
-                    c_id = str(client_info.get("client_id", i))
-                    cut = int(result["per_client_cuts"][i])
-                    per_client_cuts[c_id] = cut
-
-                return per_client_cuts
+            result = evaluate_pdd_for_one_client(
+                layer_flops=layer_gflops,
+                all_cu_flops=all_cu_flops,
+                activation_mb=activation_mb,
+                client_to_cloud_bandwidth_MBps=bandwidths,
+                inter_cloud_bandwidth_MBps= 125,
+            )
+            optimal_cut = int(result["local_cut"])
+            segments = result["segments"]
 
         except Exception as e:
             src.Log.print_with_color(f"[PDD] Lỗi tính toán: {e}", "red")

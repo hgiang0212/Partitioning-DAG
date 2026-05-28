@@ -2,8 +2,9 @@ import pika
 import uuid
 import argparse
 import yaml
-
+import json
 import torch
+from scipy.conftest import devices
 
 import src.Log
 from src.RpcClient import RpcClient
@@ -23,7 +24,10 @@ address = config["rabbit"]["address"]
 username = config["rabbit"]["username"]
 password = config["rabbit"]["password"]
 virtual_host = config["rabbit"]["virtual-host"]
+devices_path = config["profile"]["devices_path"]
 
+with open(devices_path, "r", encoding="utf-8") as f:
+    devices_profile = json.load(f)
 device = None
 
 if args.device is None:
