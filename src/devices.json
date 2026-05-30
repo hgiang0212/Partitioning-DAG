@@ -2,15 +2,15 @@
   "clouds": [
     {
         "cloud_id": "CL_1",
-        "compute_capacity_gflops": 40000,
+        "compute_capacity_gflops": 279,
         "bandwidth_mbps": 125,
-        "description": "Jetson Orin Nano 8GB"
+        "description": "orin"
     },
     {
         "cloud_id": "CL_2",
-        "compute_capacity_gflops": 40000,
+        "compute_capacity_gflops": 213.8,
         "bandwidth_mbps": 125,
-        "description": "Jetson Orin Nano 8GB"
+        "description": "nano"
     }
 ],
 
@@ -19,7 +19,7 @@
       "edge_id": "ed_1",
       "compute_capacity_gflops": 440,
       "bandwidth_mbps": 125,
-      "description": "Jetson Orin Nano 8GB"
+      "description": "DEVICE"
     }
   ],
 

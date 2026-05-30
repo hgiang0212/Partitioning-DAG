@@ -2,10 +2,10 @@ name: YOLO
 server:
   cut-layer: b
   clients:
-    - 3
-    - 3
+    - 9
+    - 2
   model: yolo26n
-  batch-size: 1
+  batch-size: 5
 
 rabbit:
   address: 127.0.0.1
@@ -17,8 +17,8 @@ pdd:
   enabled: True
   inter_cloud_bandwidth_MBps: 125.0         # BW giữa các cloud node (1 Gbps LAN)
 profile:
-  devices_path: devices.json
-  layer_profile_path: layer_profile.json
+  devices_path: src/devices.json
+  layer_profile_path: src/layer_profile.json
 debug-mode: False
 data: video.mp4
 log-path: .

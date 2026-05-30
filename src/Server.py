@@ -61,8 +61,8 @@ class Server:
             client_id = message["client_id"]
             layer_id  = message["layer_id"]
 
-            if (str(client_id), layer_id) not in self.list_clients:
-                self.list_clients.append((str(client_id), layer_id))
+            if (int(client_id), layer_id) not in self.list_clients:
+                self.list_clients.append((int(client_id), layer_id))
 
             src.Log.print_with_color(f"[<<<] Received message from client: {message}", "blue")
             self.register_clients[layer_id - 1] += 1
@@ -106,7 +106,7 @@ class Server:
                 src.Log.print_with_color(f"Download {self.model_name}", "yellow")
                 _ = YOLO(f"{self.model_name}.pt")
 
-            splits = self._compute_splits_from_profiles()
+            optimal_cut, clouds_split, num_layers_model = self._compute_splits_from_profiles()
 
             file_path = f"{self.model_name}.pt"
             if os.path.exists(file_path):
@@ -119,8 +119,10 @@ class Server:
                 sys.exit()
 
             for (client_id, layer_id) in self.list_clients:
-                # Use per-client split if available, else use a default
-                client_split = split.get(str(client_id), per_client_splits.get("default", 11))
+                if layer_id == 1:
+                    client_split = optimal_cut
+                else:
+                    client_split = clouds_split[client_id]
 
                 response = {"action": "START",
                             "message": "Server accept the connection",
@@ -129,6 +131,7 @@ class Server:
                             "batch_size": self.batch_size,
                             "num_layers": len(self.total_clients),
                             "model_name": self.model_name,
+                            "num_layers_model" : num_layers_model,
                             "data": self.data,
                             "compress": self.compress}
 
@@ -159,9 +162,7 @@ class Server:
             return static_cut
 
         # Cloud layer times
-        cloud_cap = np.asarray(devices_profile["cloud"]["compute_capacity_gflops"], dtype=float)
-        num_layers = len(cloud_cap)
-        cloud_compute = cloud_cap.reshape(1, -1)
+        cloud_compute = [cloud["compute_capacity_gflops"] for cloud in devices_profile["clouds"]]
 
         # Edge clients
         edge_clients = devices_profile["clients"]
@@ -171,33 +172,35 @@ class Server:
             )
             return static_cut
 
-        client_compute = np.asarray(edge_clients["compute_capacity_gflops"] , dtype= float)
-        all_cu_flops = np.vstack([client_compute,cloud_compute])
-
-        bandwidths = edge_clients["bandwidth_mbps"]
-
-        # In thông tin thiết bị
-        src.Log.print_with_color(
-            f"[PDD] {len(edge_clients)} edge client(s) | "
-            f"bw={bandwidths.flatten().tolist()} MB/s",
-            "cyan",
+        client_compute = [edge["compute_capacity_gflops"] for edge in edge_clients]
+        all_cu_flops = np.array(
+            client_compute + cloud_compute,
+            dtype=float
         )
 
-        layer_gflops = np.asarray(layer_profile["layer_gflops"], dtype= float)
-        CUT_DATA_SIZES_MB = np.asarray(layer_profile["CUT_DATA_SIZES_MB"], dtype= float)
+        bandwidths = edge_clients[0]["bandwidth_mbps"]
+
+        layer_gflops = np.array(layer_profile[0]["layer_gflops"], dtype= float)
+        CUT_DATA_SIZES_MB = np.array(layer_profile[0]["cut_data_sizes_mb"], dtype= float)
+
+        num_layers_model = len(CUT_DATA_SIZES_MB)+1
         activation_mb = np.concatenate([[13.0], CUT_DATA_SIZES_MB, [0.0]])
         # Chạy PDD
         try:
             result = evaluate_pdd_for_one_client(
-                layer_flops=layer_gflops,
+                layer_gflops=layer_gflops,
                 all_cu_flops=all_cu_flops,
                 activation_mb=activation_mb,
                 client_to_cloud_bandwidth_MBps=bandwidths,
-                inter_cloud_bandwidth_MBps= 125,
+                inter_cloud_bandwidth_MBps= 125.0,
             )
             optimal_cut = int(result["local_cut"])
             segments = result["segments"]
-
+            print(segments)
+            clouds_split = {}
+            for seg in segments:
+                clouds_split[seg[0]] = (seg[1],seg[2])
+            return optimal_cut, clouds_split , num_layers_model
         except Exception as e:
             src.Log.print_with_color(f"[PDD] Lỗi tính toán: {e}", "red")
             return {"default": static_cut}

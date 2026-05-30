@@ -35,6 +35,7 @@ class RpcClient:
         if action == "START":
             model_name = self.response["model_name"]
             num_layers = self.response["num_layers"]
+            num_layers_model = self.response["num_layers_model"]
             splits = self.response["splits"]
             batch_size = self.response["batch_size"]
             model = self.response["model"]
@@ -60,11 +61,11 @@ class RpcClient:
             if self.layer_id == 1:
                 client = layers[:splits]
             else:
-                client = layers[splits:]
+                client = layers[splits[0]:splits[1]]
 
             Log.print_with_color(f"Start Inference", "green")
 
-            self.inference_func(client, data, num_layers, splits, batch_size, self.logger, compress)
+            self.inference_func(client, data, num_layers, num_layers_model, splits, batch_size, self.logger, compress)
 
             return False
         else:

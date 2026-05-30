@@ -31,8 +31,10 @@ class Scheduler:
 
         self.size_message = None
         self.splits = None
-        self.intermediate_queue = "intermediate_queue"
-        self.channel.queue_declare(self.intermediate_queue, durable=False)
+        self.middle_queue = "middle_queue"
+        self.last_queue = "last_queue"
+        self.channel.queue_declare(self.middle_queue, durable=False)
+        self.channel.queue_declare(self.last_queue, durable=False)
 
         self.map_metric = None
         self.gt_dict = {}
@@ -47,7 +49,8 @@ class Scheduler:
 
     def write_metrics(self, role, batch_id, batch_size, latency_ms, fps, ram_mb,
                       message_size_bytes=0, e2e_latency_ms=0, edge_start_time=None):
-        best_cut = "N/A" if self.splits is None else self.splits - 1
+        # best_cut = "N/A" if self.splits is None else self.splits - 1
+        best_cut = self.splits
         file_path = f"metrics_raw_{str(self.client_id).replace('-', '')}.csv"
         file_exists = os.path.exists(file_path)
         with open(file_path, "a", newline="") as f:
@@ -320,6 +323,10 @@ class Scheduler:
             "data": data
         })
         self.size_message = len(message)
+        
+        # Log message size
+        Log.print_with_color(f"[>>>] Sending message to {intermediate_queue}: {self.size_message} bytes", "yellow")
+        
         self.channel.basic_publish(
             exchange='',
             routing_key=intermediate_queue,
@@ -377,7 +384,7 @@ class Scheduler:
                     "height": height,
                     "edge_start_time": edge_start_wall,
                 }
-                self.send_next_layer(self.intermediate_queue, y_msg, compress)
+                self.send_next_layer(self.middle_queue, y_msg, compress)
 
                 batch_end = time.perf_counter()
                 latency_ms = (batch_end - batch_start) * 1000
@@ -435,7 +442,7 @@ class Scheduler:
         batch_id = 0
         prev_batch_end = None
         while True:
-            method_frame, header_frame, body = self.channel.basic_get(queue=self.intermediate_queue, auto_ack=True)
+            method_frame, header_frame, body = self.channel.basic_get(queue=self.last_queue, auto_ack=True)
             if method_frame and body:
                 batch_start = time.perf_counter()
                 received_message_size = len(body)
@@ -497,20 +504,72 @@ class Scheduler:
         cv2.destroyAllWindows()
         pbar.close()
 
-    def middle_layer(self, model):
-        pass
+    def middle_layer(self, model, batch_size, splits, logger, compress):
+        model.eval()
+        model.to(self.device)
 
-    def inference_func(self, model, data, num_layers, splits, batch_size, logger, compress):
+        self.channel.basic_qos(prefetch_count=10)
+        pbar = tqdm(desc="Processing video (while loop)", unit="frame")
+        batch_id = 0
+        prev_batch_end = None
+        while True:
+            method_frame, header_frame, body = self.channel.basic_get(queue=self.middle_queue, auto_ack=True)
+            if method_frame and body:
+
+                batch_start = time.perf_counter()
+                received_message_size = len(body)
+                received_data = pickle.loads(body)
+                y = received_data["data"]
+
+                if compress["enable"]:
+                    y["data"] = Decoder(y["data"], y["shape"])
+                    y["data"] = [torch.from_numpy(t) if t is not None else None for t in y["data"]]
+
+                y["data"] = [t.to(self.device) if t is not None else None for t in y["data"]]
+                list_output = y["data"]
+                x = list_output[-1]
+                x, y = inference(model, x, list_output, splits)
+                y[-1] = x
+
+                y_msg = {
+                    "data": y,
+                    # "width": received_data["width"],
+                    # "height": received_data["height"],
+                    "edge_start_time": received_data["data"]["edge_start_time"],
+                }
+                print(f"[DEBUG] middle_layer sending to queue: {self.last_queue}")
+                self.send_next_layer(self.last_queue, y_msg, compress)
+                batch_end = time.perf_counter()
+                latency_ms = (batch_end - batch_start) * 1000
+                fps = batch_size / (batch_end - prev_batch_end) if prev_batch_end is not None else 0.0
+                ram_mb = self.get_ram_mb()
+
+                print(f"[Batch {batch_id:4d}] CLOUD | latency={latency_ms:.1f}ms | "
+                      f"fps={fps:.1f} |"
+                      f"ram={ram_mb:.1f}MB | recv={received_message_size}B")
+
+                self.write_metrics(
+                    role="cloud",
+                    batch_id=batch_id,
+                    batch_size=batch_size,
+                    latency_ms=latency_ms,
+                    fps=fps,
+                    ram_mb=ram_mb,
+                    message_size_bytes=received_message_size,
+                )
+
+    def inference_func(self, model, data, num_layers, num_layers_model, splits, batch_size, logger, compress):
         self.splits = splits
         if os.path.exists("detections_stream.jsonl"):
             os.remove("detections_stream.jsonl")
         if self.layer_id == 1:
             self.first_layer(model, data, batch_size, logger, compress)
         elif self.layer_id == num_layers:
-            self.last_layer(model, batch_size, splits, logger, compress)
-            self._print_summary()
-            self._print_map()
-            if self._det_results:
-                self._write_detections_json()
-        else:
-            self.middle_layer(model)
+            if splits[1] == num_layers_model:
+                self.last_layer(model, batch_size, splits[0], logger, compress)
+                self._print_summary()
+                self._print_map()
+                if self._det_results:
+                    self._write_detections_json()
+            else:
+                self.middle_layer(model, batch_size, splits[0], logger, compress)

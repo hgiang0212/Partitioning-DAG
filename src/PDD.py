@@ -267,19 +267,20 @@ def summarize_pdd_result(result):
 
 # Ví dụ chạy
 
-# FLOPs từng layer (GFLOPs) — lấy từ torchstat / thop
+# FLOPs từng layer (GFLOPs)
 LAYER_GFLOPS = np.array([
-    0.0,    0.074, 0.037, 0.150, 0.075, 0.150,
-    0.037,  0.075, 0.075, 0.037, 0.075, 0.0,
-    0.0,    0.150, 0.0,   0.0,   0.037, 0.019,
-    0.0,    0.075, 0.019, 0.0,   0.037, 0.001,
+    29.2552704,   69.8351616,  101.449728,   136.839168,
+    97.910784,    136.3673088, 81.1597824,   68.1836544,
+    80.216064,    38.1026304,  58.1861376,   0.2359296,
+    0.0,         111.3587712, 0.4718592,    0.0,
+    128.3457024,  34.209792,   0.0,          88.7095296,
+    34.0918272,   0.0,        107.4364416,  359.97696
 ], dtype=float)
 
 ALL_CU_GFLOPS = np.array([
-    13.5,          # UE
-    50.0,          # Cloud 0
-    40.0,          # Cloud 1
-    60.0,          # Cloud 2
+    440,
+    279,
+    213.8
 ], dtype=float)
 
 CUT_DATA_SIZES_MB = np.array([
@@ -302,3 +303,4 @@ result = evaluate_pdd_for_one_client(
     inter_cloud_bandwidth_MBps = inter_cloud_bandwidth_MBps,
 )
 result = summarize_pdd_result(result)
+print(result)
