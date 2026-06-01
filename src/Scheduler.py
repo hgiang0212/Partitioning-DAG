@@ -20,6 +20,9 @@ class Scheduler:
         self.layer_id = layer_id
         self.channel = channel
         self.device = device
+        self.channel.queue_declare("queue_0", durable=False)
+        self.channel.queue_declare("queue_1", durable=False)
+        self.channel.queue_declare("queue_2", durable=False)
 
         import glob as _glob
         for f in _glob.glob("metrics_raw_*.csv") + ["metrics_pivoted.csv", "metrics_pivot.lock"]:
@@ -31,11 +34,6 @@ class Scheduler:
 
         self.size_message = None
         self.splits = None
-        self.middle_queue = "middle_queue"
-        self.last_queue = "last_queue"
-        self.channel.queue_declare(self.middle_queue, durable=False)
-        self.channel.queue_declare(self.last_queue, durable=False)
-
         self.map_metric = None
         self.gt_dict = {}
         self._det_results = {}
@@ -339,9 +337,10 @@ class Scheduler:
                                    routing_key='rpc_queue',
                                    body=pickle.dumps(message))
 
-    def first_layer(self, model, data, batch_size, logger, compress):
+    def first_layer(self, model, data, batch_size, logger, compress, next_client_id):
         orig_images = []
         input_image = []
+
         model.eval()
         model.to(self.device)
 
@@ -384,7 +383,7 @@ class Scheduler:
                     "height": height,
                     "edge_start_time": edge_start_wall,
                 }
-                self.send_next_layer(self.middle_queue, y_msg, compress)
+                self.send_next_layer(f"queue_{next_client_id}", y_msg, compress)
 
                 batch_end = time.perf_counter()
                 latency_ms = (batch_end - batch_start) * 1000
@@ -442,7 +441,7 @@ class Scheduler:
         batch_id = 0
         prev_batch_end = None
         while True:
-            method_frame, header_frame, body = self.channel.basic_get(queue=self.last_queue, auto_ack=True)
+            method_frame, header_frame, body = self.channel.basic_get(queue=f"queue_{self.client_id}", auto_ack=True)
             if method_frame and body:
                 batch_start = time.perf_counter()
                 received_message_size = len(body)
@@ -504,7 +503,7 @@ class Scheduler:
         cv2.destroyAllWindows()
         pbar.close()
 
-    def middle_layer(self, model, batch_size, splits, logger, compress):
+    def middle_layer(self, model, batch_size, splits, logger, compress, next_client_id):
         model.eval()
         model.to(self.device)
 
@@ -513,7 +512,7 @@ class Scheduler:
         batch_id = 0
         prev_batch_end = None
         while True:
-            method_frame, header_frame, body = self.channel.basic_get(queue=self.middle_queue, auto_ack=True)
+            method_frame, header_frame, body = self.channel.basic_get(queue=f"queue_{self.client_id}", auto_ack=True)
             if method_frame and body:
 
                 batch_start = time.perf_counter()
@@ -537,8 +536,8 @@ class Scheduler:
                     # "height": received_data["height"],
                     "edge_start_time": received_data["data"]["edge_start_time"],
                 }
-                print(f"[DEBUG] middle_layer sending to queue: {self.last_queue}")
-                self.send_next_layer(self.last_queue, y_msg, compress)
+                print(f"[DEBUG] middle_layer sending to queue: {next_client_id}")
+                self.send_next_layer(f"queue_{next_client_id}", y_msg, compress)
                 batch_end = time.perf_counter()
                 latency_ms = (batch_end - batch_start) * 1000
                 fps = batch_size / (batch_end - prev_batch_end) if prev_batch_end is not None else 0.0
@@ -558,12 +557,12 @@ class Scheduler:
                     message_size_bytes=received_message_size,
                 )
 
-    def inference_func(self, model, data, num_layers, num_layers_model, splits, batch_size, logger, compress):
+    def inference_func(self, model, data, num_layers, next_client_id, num_layers_model, splits, batch_size, logger, compress):
         self.splits = splits
         if os.path.exists("detections_stream.jsonl"):
             os.remove("detections_stream.jsonl")
         if self.layer_id == 1:
-            self.first_layer(model, data, batch_size, logger, compress)
+            self.first_layer(model, data, batch_size, logger, compress, next_client_id)
         elif self.layer_id == num_layers:
             if splits[1] == num_layers_model:
                 self.last_layer(model, batch_size, splits[0], logger, compress)
@@ -572,4 +571,4 @@ class Scheduler:
                 if self._det_results:
                     self._write_detections_json()
             else:
-                self.middle_layer(model, batch_size, splits[0], logger, compress)
+                self.middle_layer(model, batch_size, splits[0], logger, compress,next_client_id)

@@ -58,14 +58,18 @@ class RpcClient:
             model = ckpt["model"].to(self.device)
             model = model.float()
             layers = model.model
+            next_client_id = 0
             if self.layer_id == 1:
-                client = layers[:splits]
+                client = layers[:splits[0]]
+                next_client_id = splits[1]
             else:
                 client = layers[splits[0]:splits[1]]
+                if splits[1] != num_layers_model:
+                    next_client_id = splits[2]
 
             Log.print_with_color(f"Start Inference", "green")
 
-            self.inference_func(client, data, num_layers, num_layers_model, splits, batch_size, self.logger, compress)
+            self.inference_func(client, data, num_layers, next_client_id , num_layers_model, splits, batch_size, self.logger, compress)
 
             return False
         else:

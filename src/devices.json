@@ -11,6 +11,12 @@
         "compute_capacity_gflops": 213.8,
         "bandwidth_mbps": 125,
         "description": "nano"
+    },
+    {
+        "cloud_id": "CL_3",
+        "compute_capacity_gflops": 571.34,
+        "bandwidth_mbps": 125,
+        "description": "dai"
     }
 ],
 

@@ -120,7 +120,7 @@ class Server:
 
             for (client_id, layer_id) in self.list_clients:
                 if layer_id == 1:
-                    client_split = optimal_cut
+                    client_split = (optimal_cut,clouds_split["first_cloud"])
                 else:
                     client_split = clouds_split[client_id]
 
@@ -198,8 +198,12 @@ class Server:
             segments = result["segments"]
             print(segments)
             clouds_split = {}
-            for seg in segments:
-                clouds_split[seg[0]] = (seg[1],seg[2])
+            clouds_split["first_cloud"] = result["first_cloud"]
+            for i in range(len(segments)):
+                if i < len(segments)-1 :
+                    clouds_split[segments[i][0]] = (segments[i][1],segments[i][2],segments[i+1][0])
+                else:
+                    clouds_split[segments[i][0]] = (segments[i][1],segments[i][2])
             return optimal_cut, clouds_split , num_layers_model
         except Exception as e:
             src.Log.print_with_color(f"[PDD] Lỗi tính toán: {e}", "red")

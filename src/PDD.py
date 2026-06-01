@@ -280,7 +280,8 @@ LAYER_GFLOPS = np.array([
 ALL_CU_GFLOPS = np.array([
     440,
     279,
-    213.8
+    213.8,
+    571.34
 ], dtype=float)
 
 CUT_DATA_SIZES_MB = np.array([
