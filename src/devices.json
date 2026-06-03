@@ -2,19 +2,19 @@
   "clouds": [
     {
         "cloud_id": "CL_1",
-        "compute_capacity_gflops": 279,
+        "compute_capacity_gflops": 70.9,
         "bandwidth_mbps": 125,
         "description": "orin"
     },
     {
         "cloud_id": "CL_2",
-        "compute_capacity_gflops": 213.8,
+        "compute_capacity_gflops": 47.45,
         "bandwidth_mbps": 125,
         "description": "nano"
     },
     {
         "cloud_id": "CL_3",
-        "compute_capacity_gflops": 571.34,
+        "compute_capacity_gflops": 31.06,
         "bandwidth_mbps": 125,
         "description": "dai"
     }
@@ -23,7 +23,7 @@
    "clients": [
     {
       "edge_id": "ed_1",
-      "compute_capacity_gflops": 440,
+      "compute_capacity_gflops": 269.64,
       "bandwidth_mbps": 125,
       "description": "DEVICE"
     }

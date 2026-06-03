@@ -32,6 +32,15 @@ class Scheduler:
                 except PermissionError:
                     Log.print_with_color(f"[!] Cannot delete {f} (file is open). Close it and retry.", "red")
 
+        cid_short = str(client_id).replace('-', '')[:12]
+        self._timing_log_edge = f"timing_edge_{cid_short}.log"
+        self._timing_log_cloud = f"timing_cloud_{cid_short}.log"
+        for tlog in [self._timing_log_edge, self._timing_log_cloud]:
+            if os.path.exists(tlog):
+                try:
+                    os.remove(tlog)
+                except Exception:
+                    pass
         self.size_message = None
         self.splits = None
         self.map_metric = None
@@ -42,29 +51,56 @@ class Scheduler:
     # ──────────────────────────── Measurement helpers ────────────────────────
 
     def get_ram_mb(self):
+        try:
+            import subprocess, re
+            result = subprocess.run(
+                ['tegrastats', '--once'],
+                capture_output=True, text=True, timeout=2
+            )
+            m = re.search(r'RAM (\d+)/\d+MB', result.stdout)
+            if m:
+                return int(m.group(1))
+        except Exception:
+            pass
         process = psutil.Process(os.getpid())
         return process.memory_info().rss / (1024 * 1024)
 
-    def write_metrics(self, role, batch_id, batch_size, latency_ms, fps, ram_mb,
-                      message_size_bytes=0, e2e_latency_ms=0, edge_start_time=None):
-        # best_cut = "N/A" if self.splits is None else self.splits - 1
-        best_cut = self.splits
+    def write_metrics(self, mode, role, best_cut, batch_id, batch_size, latency_ms, fps, ram_mb, message_size_bytes=0, e2e_latency_ms=0, edge_start_time=None):
         file_path = f"metrics_raw_{str(self.client_id).replace('-', '')}.csv"
         file_exists = os.path.exists(file_path)
+
         with open(file_path, "a", newline="") as f:
             writer = csv.writer(f)
+
             if not file_exists:
                 writer.writerow([
-                    "role", "batch_id", "batch_size", "best_cut",
-                    "latency_ms", "fps", "ram_mb",
-                    "message_size_bytes", "e2e_latency_ms", "edge_start_time",
+                    "mode",
+                    "role",
+                    "best_cut",
+                    "batch_id",
+                    "batch_size",
+                    "latency_ms",
+                    "fps",
+                    "ram_mb",
+                    "message_size_bytes",
+                    "e2e_latency_ms",
+                    "edge_start_time",
                 ])
+
             writer.writerow([
-                role, batch_id, batch_size, best_cut,
-                round(latency_ms, 3), round(fps, 3), round(ram_mb, 3),
-                message_size_bytes, round(e2e_latency_ms, 3),
+                mode,
+                role,
+                best_cut,
+                batch_id,
+                batch_size,
+                round(latency_ms, 3),
+                round(fps, 3) if fps > 0 else "",  # fps=0 (first batch) → empty
+                round(ram_mb, 3),
+                message_size_bytes,
+                round(e2e_latency_ms, 3),
                 edge_start_time if edge_start_time is not None else "",
             ])
+
 
     # ──────────────────────────── mAP helpers ────────────────────────────────
 
@@ -337,7 +373,7 @@ class Scheduler:
                                    routing_key='rpc_queue',
                                    body=pickle.dumps(message))
 
-    def first_layer(self, model, data, batch_size, logger, compress, next_client_id):
+    def first_layer(self, model, data, batch_size, logger, compress, next_client_id, mode = "split"):
         orig_images = []
         input_image = []
 
@@ -367,6 +403,8 @@ class Scheduler:
             input_image.append(tensor)
 
             if len(input_image) == batch_size:
+                with open(self._timing_log_edge, "a") as _tf:
+                    print(str(time.time_ns()) + " get input", file=_tf)
                 batch_start = time.perf_counter()
                 edge_start_wall = time.time()
 
@@ -386,8 +424,11 @@ class Scheduler:
                 self.send_next_layer(f"queue_{next_client_id}", y_msg, compress)
 
                 batch_end = time.perf_counter()
+                with open(self._timing_log_edge, "a") as _tf:
+                    print(str(time.time_ns()) + " output", file=_tf)
                 latency_ms = (batch_end - batch_start) * 1000
                 fps = batch_size / (batch_end - prev_batch_end) if prev_batch_end is not None else 0.0
+                e2e_latency_ms = latency_ms if mode == "only_edge" else 0.0
                 ram_mb = self.get_ram_mb()
                 msg_size = self.size_message if self.size_message is not None else 0
 
@@ -395,13 +436,16 @@ class Scheduler:
                       f"fps={fps:.1f} | ram={ram_mb:.1f}MB | msg={msg_size}B")
 
                 self.write_metrics(
-                    role="edge",
+                    mode=mode,
+                    role="edge_sender" if mode == "only_cloud" else "edge",
+                    best_cut=self.splits,
                     batch_id=batch_id,
                     batch_size=batch_size,
                     latency_ms=latency_ms,
                     fps=fps,
                     ram_mb=ram_mb,
                     message_size_bytes=msg_size,
+                    e2e_latency_ms=e2e_latency_ms,
                     edge_start_time=edge_start_wall,
                 )
 
@@ -414,6 +458,10 @@ class Scheduler:
                 continue
 
         print(f'size message: {self.size_message} bytes.')
+        with open(self._timing_log_edge, "a") as _tf:
+            print(str(time.time_ns()) + " end", file=_tf)
+        print(f'size message: {self.size_message} bytes.')
+
         cap.release()
         pbar.close()
 
@@ -432,7 +480,7 @@ class Scheduler:
                     break
             time.sleep(0.5)
 
-    def last_layer(self, model, batch_size, splits, logger, compress):
+    def last_layer(self, model, batch_size, splits, logger, compress,mode = "split"):
         model.eval()
         model.to(self.device)
 
@@ -440,6 +488,8 @@ class Scheduler:
         pbar = tqdm(desc="Processing video (while loop)", unit="frame")
         batch_id = 0
         prev_batch_end = None
+        with open(self._timing_log_cloud, "w") as _tf:
+            print(str(time.time_ns()) + " start", file=_tf)
         while True:
             method_frame, header_frame, body = self.channel.basic_get(queue=f"queue_{self.client_id}", auto_ack=True)
             if method_frame and body:
@@ -462,6 +512,8 @@ class Scheduler:
                 self._update_map(results, batch_id, batch_size)
 
                 batch_end = time.perf_counter()
+                with open(self._timing_log_cloud, "a") as _tf:
+                    print(str(time.time_ns()) + " output", file=_tf)
                 cloud_end_wall = time.time()
                 latency_ms = (batch_end - batch_start) * 1000
                 fps = batch_size / (batch_end - prev_batch_end) if prev_batch_end is not None else 0.0
@@ -473,7 +525,9 @@ class Scheduler:
                       f"ram={ram_mb:.1f}MB | recv={received_message_size}B")
 
                 self.write_metrics(
+                    mode=mode,
                     role="cloud",
+                    best_cut=self.splits,
                     batch_id=batch_id,
                     batch_size=batch_size,
                     latency_ms=latency_ms,
@@ -499,11 +553,12 @@ class Scheduler:
                         break
                 else:
                     time.sleep(0.5)
-
+        with open(self._timing_log_cloud, "a") as _tf:
+            print(str(time.time_ns()) + " end", file=_tf)
         cv2.destroyAllWindows()
         pbar.close()
 
-    def middle_layer(self, model, batch_size, splits, logger, compress, next_client_id):
+    def middle_layer(self, model, batch_size, splits, logger, compress, next_client_id, mode="split"):
         model.eval()
         model.to(self.device)
 
@@ -539,8 +594,12 @@ class Scheduler:
                 print(f"[DEBUG] middle_layer sending to queue: {next_client_id}")
                 self.send_next_layer(f"queue_{next_client_id}", y_msg, compress)
                 batch_end = time.perf_counter()
+                with open(self._timing_log_cloud, "a") as _tf:
+                    print(str(time.time_ns()) + " output", file=_tf)
+                cloud_end_wall = time.time()
                 latency_ms = (batch_end - batch_start) * 1000
                 fps = batch_size / (batch_end - prev_batch_end) if prev_batch_end is not None else 0.0
+                e2e_latency_ms = latency_ms if mode == "only_edge" else 0.0
                 ram_mb = self.get_ram_mb()
 
                 print(f"[Batch {batch_id:4d}] CLOUD | latency={latency_ms:.1f}ms | "
@@ -548,17 +607,41 @@ class Scheduler:
                       f"ram={ram_mb:.1f}MB | recv={received_message_size}B")
 
                 self.write_metrics(
+                    mode=mode,
                     role="cloud",
+                    best_cut=self.splits,
                     batch_id=batch_id,
                     batch_size=batch_size,
                     latency_ms=latency_ms,
                     fps=fps,
                     ram_mb=ram_mb,
                     message_size_bytes=received_message_size,
+                    e2e_latency_ms=e2e_latency_ms,
+                    edge_start_time=received_data["data"]["edge_start_time"],
                 )
+                batch_id += 1
+                prev_batch_end = batch_end
+                pbar.update(batch_size)
+            else:
+                broadcast_queue_name = f'reply_{self.client_id}'
+                method_frame, header_frame, body = self.channel.basic_get(queue=broadcast_queue_name, auto_ack=True)
+                if body:
+                    received_data = pickle.loads(body)
+                    Log.print_with_color(f"[<<<] Received message from server {received_data}", "blue")
+                    if received_data["action"] == "STOP":
+                        Log.print_with_color("[>>>] Finish!", "red")
+                        break
+                else:
+                    time.sleep(0.5)
+
+        cv2.destroyAllWindows()
+        pbar.close()
 
     def inference_func(self, model, data, num_layers, next_client_id, num_layers_model, splits, batch_size, logger, compress):
-        self.splits = splits
+        if len(splits) == 3 :
+            self.splits = (splits[0],splits[1])
+        else:
+            self.splits = splits[0]
         if os.path.exists("detections_stream.jsonl"):
             os.remove("detections_stream.jsonl")
         if self.layer_id == 1:

@@ -14,11 +14,6 @@ def inference(model, x, y, cut):
                 x = [x, y[input_yolo26[idx][1]]]
             else:
                 x = [y[input_yolo26[idx][0]], y[input_yolo26[idx][1]], y[input_yolo26[idx][2]]]
-        # DEBUG
-        if isinstance(x, list):
-            print(f"idx={idx}, input shapes: {[t.shape for t in x]}")
-        else:
-            print(f"idx={idx}, input shape: {x.shape}")
         x = layer(x)
 
         if idx in save_yolo26:

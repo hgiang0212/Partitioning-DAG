@@ -3,9 +3,9 @@ server:
   cut-layer: b
   clients:
     - 9
-    - 2
+    - 3
   model: yolo26n
-  batch-size: 5
+  batch-size: 1
 
 rabbit:
   address: 127.0.0.1
@@ -23,5 +23,5 @@ debug-mode: False
 data: video.mp4
 log-path: .
 compress:
-  enable: True
+  enable: false
   num_bit: 8
