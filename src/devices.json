@@ -2,37 +2,38 @@
   "clouds": [
     {
         "cloud_id": "CL_1",
-        "compute_capacity_gflops": 70.9,
+        "compute_capacity_gflops": 198.38,
         "bandwidth_mbps": 125,
-        "description": "orin"
+        "description": "device-1"
     },
     {
         "cloud_id": "CL_2",
-        "compute_capacity_gflops": 47.45,
+        "compute_capacity_gflops": 101.14,
         "bandwidth_mbps": 125,
-        "description": "nano"
+        "description": "device-4"
     },
     {
         "cloud_id": "CL_3",
-        "compute_capacity_gflops": 31.06,
+        "compute_capacity_gflops": 51.06,
         "bandwidth_mbps": 125,
-        "description": "dai"
+        "description": "device-7"
     }
 ],
 
    "clients": [
     {
       "edge_id": "ed_1",
-      "compute_capacity_gflops": 269.64,
+      "compute_capacity_gflops": 131.39,
       "bandwidth_mbps": 125,
-      "description": "DEVICE"
+      "description": "machine"
     }
   ],
 
-  "raw_input_mb": 13.0,
+  "raw_input_mb": 4.69,
   "cut_data_sizes_mb": [
-    13.78, 8.02, 20.5, 5.81, 9.61, 12.54, 12.38, 13.61, 13.71,
-    13.83, 13.52, 18.11, 17.89, 13.83, 26.1, 23.93, 9.94, 11.29,
-    10.87, 9.57, 10.27, 10.25, 9.42
-  ]
+    6.25, 3.125, 6.25, 1.5625, 3.125, 3.90625,
+    3.90625, 4.296875, 4.296875, 4.296875, 4.296875, 5.859375,
+    5.859375, 4.296875, 7.421875, 7.421875, 2.734375, 3.125,
+    3.125, 2.734375, 2.9296875, 2.9296875, 2.734375
+]
 }

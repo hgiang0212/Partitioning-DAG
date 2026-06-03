@@ -22,7 +22,7 @@ class Scheduler:
         self.device = device
         self.channel.queue_declare("queue_0", durable=False)
         self.channel.queue_declare("queue_1", durable=False)
-        self.channel.queue_declare("queue_2", durable=False)
+        # self.channel.queue_declare("queue_2", durable=False)
 
         import glob as _glob
         for f in _glob.glob("metrics_raw_*.csv") + ["metrics_pivoted.csv", "metrics_pivot.lock"]:

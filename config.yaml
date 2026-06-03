@@ -3,7 +3,7 @@ server:
   cut-layer: b
   clients:
     - 9
-    - 3
+    - 2
   model: yolo26n
   batch-size: 1
 
