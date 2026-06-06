@@ -19,7 +19,7 @@ def delete_old_queues(address, username, password, virtual_host):
 
         for queue in queues:
             queue_name = queue['name']
-            if queue_name.startswith("reply") or queue_name.startswith("intermediate_queue") or queue_name.startswith(
+            if queue_name.startswith("reply") or queue_name.startswith("queue_") or queue_name.startswith(
                     "result") or queue_name.startswith("rpc_queue"):
 
                 http_channel.queue_delete(queue=queue_name)

@@ -269,19 +269,19 @@ def summarize_pdd_result(result):
 
 # FLOPs từng layer (GFLOPs)
 LAYER_GFLOPS = np.array([
-    0.1015808,  0.2424832,  0.352256,   0.475136,
-    0.339968,   0.4734976,  0.2818048,  0.2367488,
-    0.278528,   0.1323008,  0.2020352,  0.0008192,
-    0.0,        0.3866624,  0.0016384,  0.0,
-    0.4456448,  0.118784,   0.0,        0.3080192,
-    0.1183744,  0.0,        0.3730432,  1.24992
+    0.9142272,   2.1823488,   3.170304,    4.276224,
+    3.059712,    4.2614784,   2.5362432,   2.1307392,
+    2.506752,    1.1907072,   1.8183168,   0.0073728,
+    0.0,         3.4799616,   0.0147456,   0.0,
+    4.0108032,   1.069056,    0.0,         2.7721728,
+    1.0653696,   0.0,         3.3573888,   11.24928
 ], dtype=float)
 
 ALL_CU_GFLOPS = np.array([
-    131.39,          # edge
-    198.38,          # Cloud 0
-    101.14,        # Cloud 1
-    51.06,
+    187.49,      # edge
+    61.68,       # Cloud 0
+    34.2,        # Cloud 1
+    19.31,       # Cloud 2
 ], dtype=float)
 
 CUT_DATA_SIZES_MB = np.array([
@@ -291,7 +291,7 @@ CUT_DATA_SIZES_MB = np.array([
     3.125, 2.734375, 2.9296875, 2.9296875, 2.734375
 ], dtype=float)
 
-activation_mb = np.concatenate([[13.0], CUT_DATA_SIZES_MB, [0.0]])
+activation_mb = np.concatenate([[4.69], CUT_DATA_SIZES_MB, [0.0]])
 
 inter_cloud_bandwidth_MBps = 125.0
 client_to_cloud_bandwidth_MBps = 125.0
