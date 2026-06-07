@@ -36,6 +36,7 @@ class Server:
         self.register_clients = [0 for _ in range(len(self.total_clients))]
         self.list_clients = []
         self.count_clients = 0
+        self.notify_counts = [0 for _ in range(len(self.total_clients))]
 
         self.channel.basic_qos(prefetch_count=1)
         self.reply_channel = self.connection.channel()
@@ -74,13 +75,12 @@ class Server:
 
         elif action == "NOTIFY":
 
-            self.count_clients += 1
+            layer_id = message["layer_id"]
+            self.notify_counts[layer_id - 1] += 1
 
-            if self.count_clients == self.total_clients[1]:
+            if self.notify_counts == self.total_clients:
                 self.logger.log_info("Stop Inference !!!")
-
                 self.notify_clients(start=False)
-
                 sys.exit()
 
         ch.basic_ack(delivery_tag=method.delivery_tag)
