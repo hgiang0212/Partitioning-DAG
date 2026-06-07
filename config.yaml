@@ -8,9 +8,9 @@ server:
   batch-size: 1
 
 rabbit:
-  address: 192.168.101.91
-  username: dai
-  password: dai
+  address: 192.168.127.234
+  username: admin
+  password: "123456"
   virtual-host: /
 
 pdd:
