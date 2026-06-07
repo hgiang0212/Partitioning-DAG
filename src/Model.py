@@ -6,7 +6,6 @@ input_yolo26 = [None,None,None,None,None,None,None,None,None,None,None,None,[-1,
     ,[-1,13],None,None,[-1,10],None,[16, 19, 22]]
 
 def inference(model, x, y, cut):
-    print(len(model))
     for i, layer in enumerate(model):
         idx = i + cut
         if input_yolo26[idx] is not None:

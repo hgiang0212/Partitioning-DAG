@@ -23,5 +23,5 @@ debug-mode: False
 data: video.mp4
 log-path: .
 compress:
-  enable: false
+  enable: False
   num_bit: 8

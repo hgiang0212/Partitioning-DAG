@@ -22,7 +22,7 @@ class Scheduler:
         self.device = device
         self.channel.queue_declare("queue_0", durable=False)
         self.channel.queue_declare("queue_1", durable=False)
-        # self.channel.queue_declare("queue_2", durable=False)
+        self.channel.queue_declare("queue_2", durable=False)
 
         import glob as _glob
         for f in _glob.glob("metrics_raw_*.csv") + ["metrics_pivoted.csv", "metrics_pivot.lock"]:
@@ -541,6 +541,7 @@ class Scheduler:
                 batch_id += 1
                 prev_batch_end = batch_end
                 pbar.update(batch_size)
+
 
             else:
                 broadcast_queue_name = f'reply_{self.client_id}'
