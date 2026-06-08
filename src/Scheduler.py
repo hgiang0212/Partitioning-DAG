@@ -493,6 +493,8 @@ class Scheduler:
         while True:
             method_frame, header_frame, body = self.channel.basic_get(queue=f"queue_{self.client_id}", auto_ack=True)
             if method_frame and body:
+                with open(self._timing_log_cloud, "a") as _tf:
+                    print(str(time.time_ns()) + " get input", file=_tf)
                 batch_start = time.perf_counter()
                 received_message_size = len(body)
                 received_data = pickle.loads(body)
@@ -556,7 +558,10 @@ class Scheduler:
                     time.sleep(0.5)
         with open(self._timing_log_cloud, "a") as _tf:
             print(str(time.time_ns()) + " end", file=_tf)
-        cv2.destroyAllWindows()
+        try:
+            cv2.destroyAllWindows()
+        except Exception:
+            pass
         pbar.close()
 
     def middle_layer(self, model, batch_size, splits, logger, compress, next_client_id, mode="split"):
@@ -570,7 +575,8 @@ class Scheduler:
         while True:
             method_frame, header_frame, body = self.channel.basic_get(queue=f"queue_{self.client_id}", auto_ack=True)
             if method_frame and body:
-
+                with open(self._timing_log_cloud, "a") as _tf:
+                    print(str(time.time_ns()) + " get input", file=_tf)
                 batch_start = time.perf_counter()
                 received_message_size = len(body)
                 received_data = pickle.loads(body)
