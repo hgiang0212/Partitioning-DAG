@@ -5,7 +5,7 @@ server:
     - 9
     - 3
   model: yolo26n
-  batch-size: 1
+  batch-size: 32
 
 rabbit:
   address: 192.168.101.234
@@ -15,7 +15,7 @@ rabbit:
 
 pdd:
   enabled: True
-  inter_cloud_bandwidth_MBps: 125.0         # BW giữa các cloud node (1 Gbps LAN)
+  inter_cloud_bandwidth_MBps: 60.0      # BW giữa các cloud node (1 Gbps LAN)
 profile:
   devices_path: src/devices.json
   layer_profile_path: src/layer_profile.json
@@ -23,5 +23,5 @@ debug-mode: False
 data: video.mp4
 log-path: .
 compress:
-  enable: False
+  enable: True
   num_bit: 8
