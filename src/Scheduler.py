@@ -23,6 +23,8 @@ class Scheduler:
         self.channel.queue_declare("queue_0", durable=False)
         self.channel.queue_declare("queue_1", durable=False)
         self.channel.queue_declare("queue_2", durable=False)
+        self.fps_queue = "fps_queue"
+        self.channel.queue_declare(queue=self.fps_queue, durable=False)
 
         import glob as _glob
         for f in _glob.glob("metrics_raw_*.csv") + ["metrics_pivoted.csv", "metrics_pivot.lock"]:
@@ -49,6 +51,14 @@ class Scheduler:
         self._load_gt_dict()
 
     # ──────────────────────────── Measurement helpers ────────────────────────
+
+    def _send_fps_done(self):
+        """Publish exactly one bare DONE per finished batch (fps_guide.md §5).
+        MUST run on the thread that owns the channel (pika is not thread-safe)."""
+        try:
+            self.channel.basic_publish(exchange="", routing_key=self.fps_queue, body=b"DONE")
+        except Exception as e:
+            Log.print_with_color(f"[FPS] send DONE failed: {e}", "red")
 
     def get_ram_mb(self):
         try:
@@ -423,6 +433,9 @@ class Scheduler:
                 }
                 self.send_next_layer(f"queue_{next_client_id}", y_msg, compress)
 
+                if mode == "only_edge":      # edge completes the batch only in this mode
+                    self._send_fps_done()
+
                 batch_end = time.perf_counter()
                 with open(self._timing_log_edge, "a") as _tf:
                     print(str(time.time_ns()) + " output", file=_tf)
@@ -512,6 +525,9 @@ class Scheduler:
 
                 results = postprocess_yolo(x)
                 self._update_map(results, batch_id, batch_size)
+
+                if mode != "only_edge":      # cloud completes the batch in split / only_cloud
+                    self._send_fps_done()
 
                 batch_end = time.perf_counter()
                 with open(self._timing_log_cloud, "a") as _tf:

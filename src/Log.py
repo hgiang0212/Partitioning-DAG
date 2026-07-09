@@ -8,6 +8,7 @@ class Colors:
         "green": '\033[92m',
         "yellow": '\033[93m',
         "red": '\033[91m',
+        "cyan": '\033[96m',
         "end": '\033[0m'
     }
 
