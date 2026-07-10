@@ -61,7 +61,7 @@ class Server:
         # ── FPS measurement (fps_guide.md) ────────────────────────────────
         fps_cfg = config.get("fps") or {}
         self._fps_grace_s = float(fps_cfg.get("grace_s", 10))          # keep collecting after work queues drain
-        self._fps_hardcap_s = float(fps_cfg.get("shutdown_timeout_s", 300))  # safety cap after first-tier shutdown
+        self._fps_hardcap_s = float(fps_cfg.get("shutdown_timeout_s", 300))  # stall detector: give up after this long with no completed batch
 
         self.channel.queue_declare(queue="fps_queue", durable=False)
         self.channel.queue_purge(queue="fps_queue")   # start every run from empty
@@ -169,9 +169,17 @@ class Server:
         if self._fps_printed:
             return
         now = time.time()
-        # hard cap: never hang forever
-        if self._fps_stop_bcast_t and (now - self._fps_stop_bcast_t) >= self._fps_hardcap_s:
-            return self._finish_fps("hard cap reached")
+        # Hard cap = stall detector: fires only after `shutdown_timeout_s` with
+        # ZERO completed batches. Each arriving DONE slides the window, so a
+        # slow-but-alive drain is never truncated — but a dead worker whose
+        # queue never moves still can't hang the server.
+        last_progress = max(
+            self._fps_times[-1] if self._fps_times else 0.0,
+            self._fps_stop_bcast_t or 0.0,
+        )
+        if last_progress and (now - last_progress) >= self._fps_hardcap_s:
+            return self._finish_fps(
+                f"hard cap reached (no completed batch for {self._fps_hardcap_s:.0f}s)")
 
         depth = self._fps_total_work_depth()
         if depth is None:

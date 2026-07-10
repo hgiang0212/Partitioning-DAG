@@ -28,4 +28,4 @@ compress:
 
 fps:
   grace_s: 10             # keep collecting DONEs this long after the work queues drain
-  shutdown_timeout_s: 300 # hard cap so a dead worker can't hang the server
+  shutdown_timeout_s: 300 # stall detector: finish only after this long with NO completed batch (a live drain never trips it)
