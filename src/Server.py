@@ -101,12 +101,14 @@ class Server:
             layer_id = message["layer_id"]
             self.notify_counts[layer_id - 1] += 1
 
-            # First tier (edges) finished → broadcast STOP but do NOT exit:
-            # keep consuming fps_queue until the work queues drain, so late
-            # DONEs from clouds still counting a backlog are not lost (§8).
+            # First tier (edges) finished → STOP the edges only, and keep
+            # consuming fps_queue until the work queues drain (§8). Clouds get
+            # their STOP from _finish_fps once every DONE is counted — sending
+            # it now lets a momentarily-starved downstream cloud exit early
+            # and lose the batches still flowing through the chain.
             if self._fps_stop_bcast_t is None and self.notify_counts[0] >= self.total_clients[0]:
                 self.logger.log_info("Stop Inference !!!")
-                self.notify_clients(start=False)
+                self.notify_clients(start=False, layers={1})
                 self._fps_stop_bcast_t = time.time()
                 self._fps_work_queues = self._fps_discover_work_queues()
                 self.connection.call_later(1.0, self._fps_drain_check)
@@ -213,6 +215,12 @@ class Server:
             print("  [SYSTEM FPS]      no DONEs received — nothing to report")
         print(f"  batches counted: {n}   stop reason: {reason}")
         print("=" * 60)
+        # Every DONE is counted — now release the tiers kept alive to drain
+        # the backlog (layers >= 2; the edges got their STOP at first-tier-done).
+        try:
+            self.notify_clients(start=False, layers=set(range(2, len(self.total_clients) + 1)))
+        except Exception:
+            pass
         try:
             self.channel.stop_consuming()   # now it's safe to end the run
         except Exception:
@@ -231,7 +239,8 @@ class Server:
     def start(self):
         self.channel.start_consuming()
 
-    def notify_clients(self, start=True):
+    def notify_clients(self, start=True, layers=None):
+        """start=False sends STOP; `layers` limits it to those layer_ids (None = all)."""
         if start:
             if os.path.exists(f"{self.model_name}.pt"):
                 src.Log.print_with_color(f"Exist {self.model_name}", "green")
@@ -275,7 +284,8 @@ class Server:
             response = {"action": "STOP",
                         "message": "Stop inference !!!"}
             for (client_id, layer_id) in self.list_clients:
-                self.send_to_response(client_id, pickle.dumps(response))
+                if layers is None or layer_id in layers:
+                    self.send_to_response(client_id, pickle.dumps(response))
 
     def _compute_splits_from_profiles(self):
         default_splits = {
