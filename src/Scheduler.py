@@ -25,6 +25,8 @@ class Scheduler:
         self.channel.queue_declare("queue_2", durable=False)
         self.fps_queue = "fps_queue"
         self.channel.queue_declare(queue=self.fps_queue, durable=False)
+        self.utilization_queue = "utilization_queue"
+        self.channel.queue_declare(queue=self.utilization_queue, durable=False)
 
         import glob as _glob
         for f in _glob.glob("metrics_raw_*.csv") + ["metrics_pivoted.csv", "metrics_pivot.lock"]:
@@ -59,6 +61,81 @@ class Scheduler:
             self.channel.basic_publish(exchange="", routing_key=self.fps_queue, body=b"DONE")
         except Exception as e:
             Log.print_with_color(f"[FPS] send DONE failed: {e}", "red")
+
+    def _compute_utilization(self, log_path, role):
+        """Parse this device's own timing log into ONE whole-run utilization
+        ratio = sum(output - get input) / (end - start)  (utilization_guide.md §3).
+        Pure file-parsing, called once after the `end` line; None on a bad log."""
+        try:
+            with open(log_path) as f:
+                lines = f.readlines()
+        except Exception as e:
+            Log.print_with_color(f"[Utilization] cannot read {log_path}: {e}", "yellow")
+            return None
+        t_start = t_end = t_input = None
+        busy_ns = 0
+        n_packages = 0
+        for line in lines:
+            parts = line.strip().split(" ", 1)   # event names contain spaces
+            if len(parts) != 2 or not parts[0].isdigit():
+                continue
+            ts, event = int(parts[0]), parts[1]
+            if event == "start":
+                t_start = ts
+            elif event == "end":
+                t_end = ts
+            elif event == "get input":
+                t_input = ts
+            elif event == "output":
+                if t_input is not None:   # unmatched "get input" is dropped
+                    busy_ns += ts - t_input
+                    n_packages += 1
+                    t_input = None
+            # any other event (e.g. queue_wait_*) is ignored → forward-extensible
+        if t_start is None or t_end is None or t_end <= t_start:
+            Log.print_with_color(f"[Utilization] incomplete timing log {log_path}", "yellow")
+            return None
+        total_ns = t_end - t_start
+        utilization = busy_ns / total_ns
+        Log.print_with_color(
+            f"[Utilization][{role}] packages={n_packages} busy={busy_ns / 1e9:.3f}s "
+            f"total={total_ns / 1e9:.3f}s utilization={utilization * 100:.2f}%", "green")
+        return {
+            "role": role,
+            "packages": n_packages,
+            "busy_ns": busy_ns,
+            "total_ns": total_ns,
+            "utilization": utilization,
+        }
+
+    def _send_utilization(self, stats):
+        """Publish the report to utilization_queue (utilization_guide.md §4).
+        Telemetry only — every failure degrades to a warning, never an exception."""
+        if stats is None:
+            return
+        message = {"action": "UTILIZATION", "client_id": self.client_id,
+                   "layer_id": self.layer_id, **stats}
+        body = pickle.dumps(message)
+        try:
+            self.channel.queue_declare(queue=self.utilization_queue, durable=False)
+            self.channel.basic_publish(exchange="", routing_key=self.utilization_queue, body=body)
+        except Exception:
+            # The channel may already be broken this late in the run → retry
+            # once on a fresh connection built from config.yaml, then give up.
+            try:
+                import pika
+                import yaml
+                with open("config.yaml") as f:
+                    rabbit = yaml.safe_load(f)["rabbit"]
+                credentials = pika.PlainCredentials(rabbit["username"], rabbit["password"])
+                connection = pika.BlockingConnection(pika.ConnectionParameters(
+                    rabbit["address"], 5672, rabbit["virtual-host"], credentials))
+                channel = connection.channel()
+                channel.queue_declare(queue=self.utilization_queue, durable=False)
+                channel.basic_publish(exchange="", routing_key=self.utilization_queue, body=body)
+                connection.close()
+            except Exception as e:
+                Log.print_with_color(f"[Utilization] send failed: {e}", "red")
 
     def get_ram_mb(self):
         try:
@@ -399,6 +476,8 @@ class Scheduler:
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
+        with open(self._timing_log_edge, "w") as _tf:
+            print(str(time.time_ns()) + " start", file=_tf)
         pbar = tqdm(desc="Processing video (while loop)", unit="frame")
         batch_id = 0
         prev_batch_end = None
@@ -477,6 +556,9 @@ class Scheduler:
 
         cap.release()
         pbar.close()
+
+        # utilization: computed from own log, sent BEFORE NOTIFY (guide §4)
+        self._send_utilization(self._compute_utilization(self._timing_log_edge, "edge"))
 
         notify_data = {"action": "NOTIFY", "client_id": self.client_id, "layer_id": self.layer_id,
                        "message": "Finish training!"}
@@ -574,6 +656,7 @@ class Scheduler:
                     time.sleep(0.5)
         with open(self._timing_log_cloud, "a") as _tf:
             print(str(time.time_ns()) + " end", file=_tf)
+        self._send_utilization(self._compute_utilization(self._timing_log_cloud, "cloud"))
         try:
             cv2.destroyAllWindows()
         except Exception:
@@ -585,6 +668,8 @@ class Scheduler:
         model.to(self.device)
 
         self.channel.basic_qos(prefetch_count=10)
+        with open(self._timing_log_cloud, "w") as _tf:
+            print(str(time.time_ns()) + " start", file=_tf)
         pbar = tqdm(desc="Processing video (while loop)", unit="frame")
         batch_id = 0
         prev_batch_end = None
@@ -657,6 +742,9 @@ class Scheduler:
                 else:
                     time.sleep(0.5)
 
+        with open(self._timing_log_cloud, "a") as _tf:
+            print(str(time.time_ns()) + " end", file=_tf)
+        self._send_utilization(self._compute_utilization(self._timing_log_cloud, "cloud"))
         cv2.destroyAllWindows()
         pbar.close()
 

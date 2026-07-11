@@ -74,8 +74,15 @@ class Server:
         self._fps_empty_since = None  # time work queues were first seen empty
         self._fps_work_queues = set() # pipeline queues to watch while draining
         self._fps_printed = False
+        self._fps_shutdown = False    # set by _finish_fps; start()'s loop exits on it
         self.batch_log_path = f"{log_path}/batch_done_ns.log"
         open(self.batch_log_path, "w").close()   # truncate: a new run never mixes with the previous one
+
+        # ── Device utilization (utilization_guide.md) ─────────────────────
+        self.channel.queue_declare(queue="utilization_queue", durable=False)
+        self.channel.queue_purge(queue="utilization_queue")   # drop stale reports from a crashed run
+        self.util_log_path = f"{log_path}/utilization.log"
+        open(self.util_log_path, "w").close()   # truncate: runs never mix
 
     def on_request(self, ch, method, _, body):
         message    = pickle.loads(body)
@@ -101,6 +108,9 @@ class Server:
             layer_id = message["layer_id"]
             self.notify_counts[layer_id - 1] += 1
 
+            src.Log.print_with_color(
+                f"[FPS] NOTIFY: {self.notify_counts[0]}/{self.total_clients[0]} edges finished", "yellow")
+
             # First tier (edges) finished → STOP the edges only, and keep
             # consuming fps_queue until the work queues drain (§8). Clouds get
             # their STOP from _finish_fps once every DONE is counted — sending
@@ -111,6 +121,8 @@ class Server:
                 self.notify_clients(start=False, layers={1})
                 self._fps_stop_bcast_t = time.time()
                 self._fps_work_queues = self._fps_discover_work_queues()
+                src.Log.print_with_color(
+                    f"[FPS] drain-watch started: watching {sorted(self._fps_work_queues)}", "yellow")
                 self.connection.call_later(1.0, self._fps_drain_check)
 
         ch.basic_ack(delivery_tag=method.delivery_tag)
@@ -182,6 +194,11 @@ class Server:
                 f"hard cap reached (no completed batch for {self._fps_hardcap_s:.0f}s)")
 
         depth = self._fps_total_work_depth()
+        self._fps_drain_ticks = getattr(self, "_fps_drain_ticks", 0) + 1
+        if self._fps_drain_ticks % 5 == 0:   # heartbeat so a long drain is visibly alive
+            src.Log.print_with_color(
+                f"[FPS] draining: work depth={depth}  DONEs={len(self._fps_times)}  "
+                f"(finish {self._fps_grace_s:.0f}s after depth stays 0)", "yellow")
         if depth is None:
             # can't query queues → fall back to "no DONE for grace seconds"
             last = self._fps_times[-1] if self._fps_times else self._fps_stop_bcast_t
@@ -227,12 +244,46 @@ class Server:
         # the backlog (layers >= 2; the edges got their STOP at first-tier-done).
         try:
             self.notify_clients(start=False, layers=set(range(2, len(self.total_clients) + 1)))
-        except Exception:
-            pass
-        try:
-            self.channel.stop_consuming()   # now it's safe to end the run
-        except Exception:
-            pass
+        except Exception as e:
+            src.Log.print_with_color(f"[FPS] releasing clouds failed: {e}", "red")
+        # No stop_consuming() here — it would have to unwind pika's nested
+        # dispatch from inside this timer callback. Just flag the main loop
+        # in start(), which closes the connection from the main frame.
+        self._fps_shutdown = True
+
+    def _collect_utilization(self, timeout_s=30.0):
+        """Drain utilization_queue into utilization.log (utilization_guide.md §5).
+        Runs after the FPS summary — every device has (or is about to have)
+        published its report; they sit on the broker until fetched here."""
+        expected = {cid for cid, _ in self.list_clients}
+        reported = set()
+        deadline = time.time() + timeout_s
+        while len(reported) < len(expected) and time.time() < deadline:
+            method_frame, _props, body = self.channel.basic_get(
+                queue="utilization_queue", auto_ack=True)
+            if not body:
+                time.sleep(0.2)
+                continue
+            try:
+                message = pickle.loads(body)
+            except Exception:
+                continue
+            if not isinstance(message, dict) or message.get("action") != "UTILIZATION":
+                continue
+            t_ns = time.time_ns()   # server-clock arrival prefix
+            reported.add(message.get("client_id"))
+            line = (f"{t_ns} client={message.get('client_id')} role={message.get('role')} "
+                    f"packages={message.get('packages')} "
+                    f"busy_s={message.get('busy_ns', 0) / 1e9:.3f} "
+                    f"total_s={message.get('total_ns', 0) / 1e9:.3f} "
+                    f"utilization={message.get('utilization', 0.0) * 100:.2f}%")
+            with open(self.util_log_path, "a") as f:
+                f.write(line + "\n")
+            src.Log.print_with_color(f"[Utilization] {line}", "green")
+        if len(reported) < len(expected):
+            src.Log.print_with_color(
+                f"[Utilization] Collected {len(reported)}/{len(expected)} reports before timeout",
+                "yellow")
 
     def send_to_response(self, client_id, message):
         reply_queue_name = f"reply_{client_id}"
@@ -245,7 +296,22 @@ class Server:
         )
 
     def start(self):
-        self.channel.start_consuming()
+        # Drive the ioloop from the main frame instead of start_consuming():
+        # consumer + timer callbacks are dispatched by process_data_events, and
+        # the exit condition is checked OUT here, outside any callback — so
+        # shutdown never depends on stop_consuming() unwinding pika's nested
+        # dispatch (which is what left the server hanging after the summary).
+        while not self._fps_shutdown:
+            self.connection.process_data_events(time_limit=1.0)
+        self._collect_utilization()   # after FPS summary, before close (guide §5)
+        try:
+            self.connection.close()
+        except Exception:
+            pass
+        # Belt-and-braces: a stray non-daemon thread (torch/ultralytics) must
+        # not keep a finished server process alive.
+        sys.stdout.flush()
+        os._exit(0)
 
     def notify_clients(self, start=True, layers=None):
         """start=False sends STOP; `layers` limits it to those layer_ids (None = all)."""
