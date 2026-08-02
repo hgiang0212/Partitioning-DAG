@@ -624,8 +624,10 @@ class Server:
                 self.send_to_response(client_id, pickle.dumps(response))
 
             # The split decision, overlaid on the timeline as a vertical rule.
+            # No `key=value` in the description: the universal parser would pick
+            # it up as a kv pair, and this trailing text is meant to be ignored.
             self._log_event(f"queue_{clouds_split['first_cloud']}",
-                            f"cut {optimal_cut} first_cloud={clouds_split['first_cloud']} "
+                            f"cut {optimal_cut} "
                             f"({'pdd' if self.pdd else 'static'})")
             self._fps_start_t = time.time()   # shared START: the clock starts when work is dispatched
         else:
