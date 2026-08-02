@@ -8,8 +8,8 @@ server:
   batch-size: 32
 
 rabbit:
-  address: 192.168.101.234
-  username: admin
+  address: 192.168.101.91
+  username: "machine-1"
   password: "123456"
   virtual-host: /
 
