@@ -1,8 +1,10 @@
 import os
 import sys
 import json
+import math
 import time
 import base64
+import shutil
 import threading
 import pickle
 import urllib.parse
@@ -58,7 +60,30 @@ class Server:
         self.logger.log_info(f"Application start. Server is waiting for {self.total_clients} clients.")
         src.Log.print_with_color(f"Application start. Server is waiting for {self.total_clients} clients.", "green")
 
-        # ── FPS measurement (fps_guide.md) ────────────────────────────────
+        # ── Result files (guide/01-result-format.md §2) ────────────────────
+        # Naming scheme for THIS project: `group_*` filenames carrying `cluster=`
+        # keys. One scheme per project — never mix in the `fps_cluster_*` set.
+        # A group here is the cloud chain an edge feeds, named after the queue it
+        # publishes into (`queue_2`); the completing tier tags every DONE with it.
+        self.log_path = log_path
+        self.batch_log_path     = f"{log_path}/batch_done_ns.log"
+        self.group_rate_ns_path = f"{log_path}/group_rate_ns.log"
+        self.group_rate_path    = f"{log_path}/group_rate.log"
+        self.util_log_path      = f"{log_path}/utilization.log"
+        self.util_group_path    = f"{log_path}/utilization_group.log"
+        self.latency_group_path = f"{log_path}/latency_group.log"
+        self.events_path        = f"{log_path}/events_ns.log"
+        self.result_files = [self.batch_log_path, self.group_rate_ns_path,
+                             self.group_rate_path, self.util_log_path,
+                             self.util_group_path, self.latency_group_path,
+                             self.events_path]
+        # Truncate ALL seven UNCONDITIONALLY, once, centrally, before any worker
+        # can write (01 §4). Conditional truncation is how a previous run's file
+        # leaks into this run's archive (05 §4).
+        for path in self.result_files:
+            open(path, "w").close()
+
+        # ── FPS measurement (guide/02-throughput.md) ───────────────────────
         fps_cfg = config.get("fps") or {}
         self._fps_grace_s = float(fps_cfg.get("grace_s", 10))          # keep collecting after work queues drain
         self._fps_hardcap_s = float(fps_cfg.get("shutdown_timeout_s", 300))  # stall detector: give up after this long with no completed batch
@@ -68,21 +93,24 @@ class Server:
         self.channel.basic_consume(queue="fps_queue", on_message_callback=self.on_fps)
 
         self._fps_times = []          # arrival time of every DONE (seconds, server clock)
+        self._group_times = {}        # cluster -> that group's arrival times, same clock
         self._fps_start_t = None      # set when START is dispatched to the workers
-        self._fps_window = 16         # DONEs per live smoothed sample
+        self._fps_window = 16         # DONEs per live smoothed sample (W; charts assume 16)
         self._fps_stop_bcast_t = None # time the first tier finished
         self._fps_empty_since = None  # time work queues were first seen empty
         self._fps_work_queues = set() # pipeline queues to watch while draining
         self._fps_printed = False
         self._fps_shutdown = False    # set by _finish_fps; start()'s loop exits on it
-        self.batch_log_path = f"{log_path}/batch_done_ns.log"
-        open(self.batch_log_path, "w").close()   # truncate: a new run never mixes with the previous one
 
-        # ── Device utilization (utilization_guide.md) ─────────────────────
+        # ── Device utilization + latency (guide/03, guide/04) ──────────────
         self.channel.queue_declare(queue="utilization_queue", durable=False)
         self.channel.queue_purge(queue="utilization_queue")   # drop stale reports from a crashed run
-        self.util_log_path = f"{log_path}/utilization.log"
-        open(self.util_log_path, "w").close()   # truncate: runs never mix
+
+        # ── Archiving (guide/05-archiving.md) ──────────────────────────────
+        archive_cfg = config.get("archive") or {}
+        self._archive_enabled = bool(archive_cfg.get("enabled", True))
+        self._archive_root = archive_cfg.get("path", "results")
+        self._config_path = archive_cfg.get("config_path", "config.yaml")
 
     def on_request(self, ch, method, _, body):
         message    = pickle.loads(body)
@@ -118,6 +146,7 @@ class Server:
             # and lose the batches still flowing through the chain.
             if self._fps_stop_bcast_t is None and self.notify_counts[0] >= self.total_clients[0]:
                 self.logger.log_info("Stop Inference !!!")
+                self._log_event("system", "all edges finished, STOP broadcast to layer 1")
                 self.notify_clients(start=False, layers={1})
                 self._fps_stop_bcast_t = time.time()
                 self._fps_work_queues = self._fps_discover_work_queues()
@@ -127,12 +156,28 @@ class Server:
 
         ch.basic_ack(delivery_tag=method.delivery_tag)
 
-    # ──────────────────────────── FPS (fps_guide.md) ─────────────────────────
+    # ─────────────────── Control-plane events (01 §3.7) ──────────────────────
+
+    def _log_event(self, scope, description):
+        """One control decision per line: `<ts_ns> <scope>: <description>`.
+        The timestamp is taken BEFORE the decision is broadcast, so it marks when
+        the decision was made rather than when it landed. The file is opened and
+        closed per append, so no handle is ever shared across threads."""
+        try:
+            with open(self.events_path, "a") as f:
+                f.write(f"{time.time_ns()} {scope}: {description}\n")
+        except Exception as e:
+            src.Log.print_with_color(f"[Events] write failed: {e}", "yellow")
+
+    # ──────────────────────── FPS (guide/02-throughput.md) ───────────────────
 
     def on_fps(self, ch, method, _props, body):
-        # body (b"DONE") is intentionally ignored — the arrival is the event.
+        # The ARRIVAL is the event. The body carries an identity (the producing
+        # group) and never a measurement, so a garbled body can mis-bucket one
+        # batch but can never distort a rate.
         t_ns = time.time_ns()          # ONE clock reading, used for both the FPS math and the log
-        self._fps_times.append(t_ns / 1e9)
+        t_s = t_ns / 1e9
+        self._fps_times.append(t_s)
         n = len(self._fps_times)
         W = self._fps_window
         window_fps = None
@@ -142,11 +187,32 @@ class Server:
                 window_fps = (W - 1) * self.batch_size / span
                 src.Log.print_with_color(
                     f"[FPS] DONE #{n}  window_fps={window_fps:6.2f} (last {W} batches)", "cyan")
-        with open(self.batch_log_path, "a") as f:    # per-batch ns log
+        with open(self.batch_log_path, "a") as f:    # authoritative system series
             if window_fps is None:
                 f.write(f"{t_ns}\n")
             else:
                 f.write(f"{t_ns} {window_fps:.2f}\n")
+
+        # Same arrival, bucketed by group (01 §3.2). An unrecognised body is
+        # bucketed as `unknown`, never dropped — an old worker degrades the
+        # breakdown instead of losing batches, so the line counts still match.
+        try:
+            cluster = body.decode("utf-8", "ignore").strip()
+        except Exception:
+            cluster = ""
+        if not cluster or " " in cluster or cluster == "DONE":
+            cluster = "unknown"
+        group = self._group_times.setdefault(cluster, [])
+        group.append(t_s)
+        gn = len(group)
+        group_line = f"{t_ns} cluster={cluster} done={gn}"
+        if gn >= W:                 # a group reaches its first full window LATER
+            gspan = group[-1] - group[-W]        # than the system does — correct, not a bug
+            if gspan > 0:
+                group_line += f" window_fps={(W - 1) * self.batch_size / gspan:.2f}"
+        with open(self.group_rate_ns_path, "a") as f:
+            f.write(group_line + "\n")
+
         ch.basic_ack(delivery_tag=method.delivery_tag)
 
     def _fps_discover_work_queues(self):
@@ -240,8 +306,10 @@ class Server:
             print("  [SYSTEM FPS]      no DONEs received — nothing to report")
         print(f"  batches counted: {n}   stop reason: {reason}")
         print("=" * 60)
+        self._write_group_rate()
         # Every DONE is counted — now release the tiers kept alive to drain
         # the backlog (layers >= 2; the edges got their STOP at first-tier-done).
+        self._log_event("system", f"drain complete, releasing clouds ({reason})")
         try:
             self.notify_clients(start=False, layers=set(range(2, len(self.total_clients) + 1)))
         except Exception as e:
@@ -251,12 +319,54 @@ class Server:
         # in start(), which closes the connection from the main frame.
         self._fps_shutdown = True
 
+    def _write_group_rate(self):
+        """Throughput summary: one line per group + one SYSTEM line (01 §3.3).
+
+        `fps` uses the SHARED START for every scope, with each scope's own last
+        completion as the end — that is what makes `SYSTEM span == max group
+        span` hold. `steady_fps` uses the group's OWN first completion, so a
+        group that started late is not penalised; it is the fair number for
+        comparing groups. Group `fps` values do NOT sum to SYSTEM and are not
+        meant to: each divides by its own span, so Σ group_fps >= SYSTEM fps."""
+        t_ns = time.time_ns()
+        bs, start = self.batch_size, self._fps_start_t
+        total_done = len(self._fps_times)
+        lines = []
+        for cluster, times in sorted(self._group_times.items()):
+            n = len(times)
+            frames = n * bs
+            fps = frames / (times[-1] - start) if start and times[-1] > start else 0.0
+            steady = ((n - 1) * bs / (times[-1] - times[0])
+                      if n >= 2 and times[-1] > times[0] else 0.0)
+            share = 100.0 * n / total_done if total_done else 0.0
+            lines.append(f"{t_ns} cluster={cluster} fps={fps:.3f} steady_fps={steady:.3f} "
+                         f"done={n} frames={frames} share={share:.1f}%")
+        sys_frames = total_done * bs
+        sys_fps = (sys_frames / (self._fps_times[-1] - start)
+                   if start and total_done and self._fps_times[-1] > start else 0.0)
+        # The SYSTEM line carries neither steady_fps nor share, by spec.
+        lines.append(f"{t_ns} SYSTEM fps={sys_fps:.3f} done={total_done} "
+                     f"frames={sys_frames} clusters={len(self._group_times)}")
+        try:
+            with open(self.group_rate_path, "w") as f:
+                f.write("\n".join(lines) + "\n")
+            for line in lines:
+                src.Log.print_with_color(f"[FPS] {line}", "cyan")
+        except Exception as e:
+            src.Log.print_with_color(f"[FPS] writing {self.group_rate_path} failed: {e}", "red")
+
+    # ─────────────── Utilization + latency collection (03, 04) ───────────────
+
     def _collect_utilization(self, timeout_s=30.0):
-        """Drain utilization_queue into utilization.log (utilization_guide.md §5).
+        """Drain utilization_queue into utilization.log, then roll the same
+        reports up into utilization_group.log and latency_group.log (03 §5).
+
         Runs after the FPS summary — every device has (or is about to have)
-        published its report; they sit on the broker until fetched here."""
+        published its report, and the reports sit on the broker until fetched
+        here, so publisher and consumer never need to be alive at once."""
         expected = {cid for cid, _ in self.list_clients}
         reported = set()
+        reports = []
         deadline = time.time() + timeout_s
         while len(reported) < len(expected) and time.time() < deadline:
             method_frame, _props, body = self.channel.basic_get(
@@ -272,6 +382,7 @@ class Server:
                 continue
             t_ns = time.time_ns()   # server-clock arrival prefix
             reported.add(message.get("client_id"))
+            reports.append(message)
             line = (f"{t_ns} client={message.get('client_id')} role={message.get('role')} "
                     f"packages={message.get('packages')} "
                     f"busy_s={message.get('busy_ns', 0) / 1e9:.3f} "
@@ -281,9 +392,167 @@ class Server:
                 f.write(line + "\n")
             src.Log.print_with_color(f"[Utilization] {line}", "green")
         if len(reported) < len(expected):
+            # A partial collection warns but never aborts: telemetry loses a
+            # number, it must not lose the run.
             src.Log.print_with_color(
                 f"[Utilization] Collected {len(reported)}/{len(expected)} reports before timeout",
                 "yellow")
+        self._write_utilization_group(reports)
+        self._write_latency_group(reports)
+
+    @staticmethod
+    def _cluster_of(report):
+        return report.get("cluster") or "unknown"
+
+    def _write_utilization_group(self, reports):
+        """Roll the per-device reports up per group and per group/role (01 §3.5).
+
+        `utilization` is POOLED (Σbusy / Σtotal), weighting each device by how
+        long it ran; `utilization_mean` is the plain mean of the per-device
+        ratios. Both are emitted on ALL/SYSTEM lines because a pooled figure can
+        hide one idle device inside a busy group — when the two diverge, the
+        group is imbalanced, and that divergence is the signal."""
+        def ratios(devs):
+            busy = sum(d.get("busy_ns", 0) for d in devs)
+            total = sum(d.get("total_ns", 0) for d in devs)
+            pooled = busy / total if total else 0.0
+            per_device = [d["busy_ns"] / d["total_ns"] for d in devs
+                          if d.get("total_ns")]
+            mean = sum(per_device) / len(per_device) if per_device else 0.0
+            packages = sum(d.get("packages", 0) for d in devs)
+            return busy, total, pooled, mean, packages
+
+        by_cluster = {}
+        for report in reports:
+            by_cluster.setdefault(self._cluster_of(report), []).append(report)
+
+        t_ns = time.time_ns()
+        lines = []
+        for cluster, devs in sorted(by_cluster.items()):
+            busy, total, pooled, mean, packages = ratios(devs)
+            lines.append(f"{t_ns} cluster={cluster} ALL devices={len(devs)} "
+                         f"utilization={pooled * 100:.2f}% utilization_mean={mean * 100:.2f}% "
+                         f"busy_s={busy / 1e9:.3f} total_s={total / 1e9:.3f} packages={packages}")
+            for role in sorted({d.get("role") or "unknown" for d in devs}):
+                role_devs = [d for d in devs if (d.get("role") or "unknown") == role]
+                busy, total, pooled, _mean, packages = ratios(role_devs)
+                lines.append(f"{t_ns} cluster={cluster} role={role} devices={len(role_devs)} "
+                             f"utilization={pooled * 100:.2f}% busy_s={busy / 1e9:.3f} "
+                             f"total_s={total / 1e9:.3f} packages={packages}")
+        busy, total, pooled, mean, _packages = ratios(reports)
+        lines.append(f"{t_ns} SYSTEM devices={len(reports)} clusters={len(by_cluster)} "
+                     f"utilization={pooled * 100:.2f}% utilization_mean={mean * 100:.2f}% "
+                     f"busy_s={busy / 1e9:.3f} total_s={total / 1e9:.3f}")
+        try:
+            with open(self.util_group_path, "w") as f:
+                f.write("\n".join(lines) + "\n")
+            src.Log.print_with_color(f"[Utilization] {lines[-1]}", "green")
+        except Exception as e:
+            src.Log.print_with_color(
+                f"[Utilization] writing {self.util_group_path} failed: {e}", "yellow")
+
+    @staticmethod
+    def _percentile(sorted_samples, q):
+        """Nearest-rank percentile, no interpolation — every number printed is a
+        latency that was actually observed on some batch. q in [0, 100]."""
+        if not sorted_samples:
+            return None
+        k = max(1, math.ceil(q / 100.0 * len(sorted_samples)))
+        return sorted_samples[k - 1]
+
+    def _latency_stats_line(self, t_ns, scope, kind, samples):
+        """One `latency_group.log` line from POOLED raw samples. Percentiles are
+        never averaged across devices — that has no statistical meaning — so the
+        devices ship raw arrays and the reduction happens once, here."""
+        s = sorted(samples)
+        return (f"{t_ns} {scope} kind={kind} n={len(s)} "
+                f"mean_ms={sum(s) / len(s):.3f} "
+                f"p50_ms={self._percentile(s, 50):.3f} "
+                f"p95_ms={self._percentile(s, 95):.3f} "
+                f"max_ms={s[-1]:.3f}")
+
+    def _write_latency_group(self, reports):
+        """Latency distributions per group/role, per group, and SYSTEM (01 §3.6).
+
+        `service` spans the device's own get input -> output, so its samples sum
+        to that scope's `busy_s` in utilization_group.log — the conformance check
+        that ties the two files together. `pipeline` adds any local buffering
+        before the batch was ready. `e2e` spans two machines by definition and is
+        reported only by the completing tier, so it carries no `role=`."""
+        by_role = {}     # (cluster, role) -> {kind: samples}
+        by_cluster = {}  # cluster -> e2e samples
+        system_e2e = []
+        for report in reports:
+            cluster = self._cluster_of(report)
+            role = report.get("role") or "unknown"
+            for kind in ("service", "pipeline"):
+                samples = report.get(f"{kind}_ms") or []
+                if samples:
+                    by_role.setdefault((cluster, role), {}).setdefault(kind, []).extend(samples)
+            e2e = report.get("e2e_ms") or []
+            if e2e:
+                by_cluster.setdefault(cluster, []).extend(e2e)
+                system_e2e.extend(e2e)
+
+        t_ns = time.time_ns()
+        lines = []
+        for (cluster, role), kinds in sorted(by_role.items()):
+            for kind in ("service", "pipeline"):
+                if kinds.get(kind):
+                    lines.append(self._latency_stats_line(
+                        t_ns, f"cluster={cluster} role={role}", kind, kinds[kind]))
+        for cluster, samples in sorted(by_cluster.items()):
+            lines.append(self._latency_stats_line(t_ns, f"cluster={cluster}", "e2e", samples))
+        if system_e2e:
+            lines.append(self._latency_stats_line(t_ns, "SYSTEM", "e2e", system_e2e))
+        try:
+            with open(self.latency_group_path, "w") as f:
+                f.write(("\n".join(lines) + "\n") if lines else "")
+            for line in lines:
+                src.Log.print_with_color(f"[Latency] {line}", "cyan")
+        except Exception as e:
+            src.Log.print_with_color(
+                f"[Latency] writing {self.latency_group_path} failed: {e}", "yellow")
+
+    # ─────────────────── Archiving (guide/05-archiving.md) ───────────────────
+
+    def _archive_results(self):
+        """Copy this run's logs plus the config that produced them into
+        results/<run-id>/. Copy, never move — the live log directory keeps its
+        own copies where every existing reader expects them, and the next run
+        truncates them itself. Failure is non-fatal."""
+        if not self._archive_enabled:
+            return
+        try:
+            tag = "pdd" if self.pdd else f"static_{self.cut_layer}"
+            run_id = f"results_{time.strftime('%m%d')}_{time.strftime('%H%M')}_{tag}"
+            dest = os.path.join(self._archive_root, run_id)
+            suffix = 1
+            while os.path.exists(dest):        # collision-safe: …-2, …-3
+                suffix += 1
+                dest = os.path.join(self._archive_root, f"{run_id}-{suffix}")
+            os.makedirs(dest, exist_ok=True)
+
+            copied = []
+            for path in self.result_files:
+                # Skip empty files: a zero-length log must never be archived as
+                # a misleading result. Every file here was truncated at startup,
+                # so nothing non-empty can be a leftover from a previous run.
+                if os.path.exists(path) and os.path.getsize(path) > 0:
+                    shutil.copy2(path, os.path.join(dest, os.path.basename(path)))
+                    copied.append(os.path.basename(path))
+            if os.path.exists(self._config_path):
+                shutil.copy2(self._config_path, os.path.join(dest, "config.yaml"))
+                copied.append("config.yaml")
+
+            if len(copied) <= 1:   # config only, or nothing at all
+                src.Log.print_with_color(
+                    f"[Archive] {dest} is EMPTY — this run produced no results", "red")
+            else:
+                src.Log.print_with_color(
+                    f"[Archive] {dest}  ({len(copied)} files: {', '.join(copied)})", "green")
+        except Exception as e:
+            src.Log.print_with_color(f"[Archive] failed: {e}", "yellow")
 
     def send_to_response(self, client_id, message):
         reply_queue_name = f"reply_{client_id}"
@@ -303,7 +572,8 @@ class Server:
         # dispatch (which is what left the server hanging after the summary).
         while not self._fps_shutdown:
             self.connection.process_data_events(time_limit=1.0)
-        self._collect_utilization()   # after FPS summary, before close (guide §5)
+        self._collect_utilization()   # after FPS summary, before close (03 §5)
+        self._archive_results()       # after the last shutdown pipeline has written (05 §3)
         try:
             self.connection.close()
         except Exception:
@@ -353,7 +623,11 @@ class Server:
 
                 self.send_to_response(client_id, pickle.dumps(response))
 
-            self._fps_start_t = time.time()   # clock starts when work is dispatched (§9)
+            # The split decision, overlaid on the timeline as a vertical rule.
+            self._log_event(f"queue_{clouds_split['first_cloud']}",
+                            f"cut {optimal_cut} first_cloud={clouds_split['first_cloud']} "
+                            f"({'pdd' if self.pdd else 'static'})")
+            self._fps_start_t = time.time()   # shared START: the clock starts when work is dispatched
         else:
             response = {"action": "STOP",
                         "message": "Stop inference !!!"}

@@ -29,3 +29,8 @@ compress:
 fps:
   grace_s: 10             # keep collecting DONEs this long after the work queues drain
   shutdown_timeout_s: 300 # stall detector: finish only after this long with NO completed batch (a live drain never trips it)
+
+archive:                  # guide/05-archiving.md — makes runs comparable weeks later
+  enabled: True
+  path: results           # results/results_<MMDD>_<HHMM>_<tag>/
+  config_path: config.yaml  # archived beside the numbers; without it they are unreadable in a month

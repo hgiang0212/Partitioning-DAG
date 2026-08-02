@@ -45,6 +45,16 @@ class Scheduler:
                     os.remove(tlog)
                 except Exception:
                     pass
+        # Group id (01 §3.2): the cloud chain this device belongs to, named after
+        # the queue the edge publishes into. The edge derives it from its own
+        # next hop; every downstream tier reads it off the incoming message, so
+        # the completing tier can tag its DONE with the group that produced it.
+        self.cluster = "unknown"
+        # Raw per-batch latency samples, shipped unreduced at shutdown (04 §1) —
+        # percentiles cannot validly be averaged across devices, so the server
+        # pools these and reduces once.
+        self._pipeline_ms = []
+        self._e2e_ms = []
         self.size_message = None
         self.splits = None
         self.map_metric = None
@@ -55,17 +65,25 @@ class Scheduler:
     # ──────────────────────────── Measurement helpers ────────────────────────
 
     def _send_fps_done(self):
-        """Publish exactly one bare DONE per finished batch (fps_guide.md §5).
+        """Publish exactly one completion per finished batch, tagged with the
+        group id (02 §3-4). The body is an IDENTITY, never a measurement or a
+        timestamp — a garbled body can mis-bucket one batch but can never distort
+        a rate, and the server's arrival clock does all the timing.
         MUST run on the thread that owns the channel (pika is not thread-safe)."""
         try:
-            self.channel.basic_publish(exchange="", routing_key=self.fps_queue, body=b"DONE")
+            self.channel.basic_publish(exchange="", routing_key=self.fps_queue,
+                                       body=str(self.cluster).encode())
         except Exception as e:
             Log.print_with_color(f"[FPS] send DONE failed: {e}", "red")
 
     def _compute_utilization(self, log_path, role):
         """Parse this device's own timing log into ONE whole-run utilization
-        ratio = sum(output - get input) / (end - start)  (utilization_guide.md §3).
-        Pure file-parsing, called once after the `end` line; None on a bad log."""
+        ratio = sum(output - get input) / (end - start)  (03 §3).
+        Pure file-parsing, called once after the `end` line; None on a bad log.
+
+        The same intervals are also returned as raw `service_ms` samples, so
+        `Σ service == busy_s` holds by construction — that identity is the
+        conformance check tying latency_group.log to utilization_group.log."""
         try:
             with open(log_path) as f:
                 lines = f.readlines()
@@ -75,6 +93,7 @@ class Scheduler:
         t_start = t_end = t_input = None
         busy_ns = 0
         n_packages = 0
+        service_ms = []
         for line in lines:
             parts = line.strip().split(" ", 1)   # event names contain spaces
             if len(parts) != 2 or not parts[0].isdigit():
@@ -89,6 +108,7 @@ class Scheduler:
             elif event == "output":
                 if t_input is not None:   # unmatched "get input" is dropped
                     busy_ns += ts - t_input
+                    service_ms.append((ts - t_input) / 1e6)
                     n_packages += 1
                     t_input = None
             # any other event (e.g. queue_wait_*) is ignored → forward-extensible
@@ -106,15 +126,19 @@ class Scheduler:
             "busy_ns": busy_ns,
             "total_ns": total_ns,
             "utilization": utilization,
+            "service_ms": service_ms,
         }
 
     def _send_utilization(self, stats):
-        """Publish the report to utilization_queue (utilization_guide.md §4).
+        """Publish the report to utilization_queue (03 §4, 04 §3). Raw latency
+        arrays ride along with it — never pre-reduced percentiles.
         Telemetry only — every failure degrades to a warning, never an exception."""
         if stats is None:
             return
         message = {"action": "UTILIZATION", "client_id": self.client_id,
-                   "layer_id": self.layer_id, **stats}
+                   "layer_id": self.layer_id, "cluster": self.cluster,
+                   "pipeline_ms": self._pipeline_ms, "e2e_ms": self._e2e_ms,
+                   **stats}
         body = pickle.dumps(message)
         try:
             self.channel.queue_declare(queue=self.utilization_queue, durable=False)
@@ -476,15 +500,26 @@ class Scheduler:
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
+        # This edge's group = the cloud chain it feeds (01 §3.2). Every batch it
+        # emits is tagged with it, and every tier downstream forwards the tag.
+        self.cluster = f"queue_{next_client_id}"
+
         with open(self._timing_log_edge, "w") as _tf:
             print(str(time.time_ns()) + " start", file=_tf)
         pbar = tqdm(desc="Processing video (while loop)", unit="frame")
         batch_id = 0
         prev_batch_end = None
+        batch_first_frame_ns = None
         while True:
             ret, frame = cap.read()
             if not ret:
                 break
+            if not input_image:
+                # `pipeline` starts here, not at `get input`: the first frame of
+                # a batch sits in the buffer until the batch fills, and that wait
+                # is latency the frame really experienced (04 §2.2). The gap
+                # between pipeline and service is the cost of the batch size.
+                batch_first_frame_ns = time.time_ns()
             frame = cv2.resize(frame, (640, 640))
             orig_images.append(copy.deepcopy(frame))
             frame = frame.astype('float32') / 255.0
@@ -509,6 +544,7 @@ class Scheduler:
                     "width": width,
                     "height": height,
                     "edge_start_time": edge_start_wall,
+                    "cluster": self.cluster,
                 }
                 self.send_next_layer(f"queue_{next_client_id}", y_msg, compress)
 
@@ -516,8 +552,13 @@ class Scheduler:
                     self._send_fps_done()
 
                 batch_end = time.perf_counter()
+                output_ns = time.time_ns()
                 with open(self._timing_log_edge, "a") as _tf:
-                    print(str(time.time_ns()) + " output", file=_tf)
+                    print(str(output_ns) + " output", file=_tf)
+                if batch_first_frame_ns is not None:
+                    self._pipeline_ms.append((output_ns - batch_first_frame_ns) / 1e6)
+                if mode == "only_edge":      # only the completing tier reports e2e
+                    self._e2e_ms.append((output_ns / 1e9 - edge_start_wall) * 1000)
                 latency_ms = (batch_end - batch_start) * 1000
                 fps = batch_size / (batch_end - prev_batch_end) if prev_batch_end is not None else 0.0
                 e2e_latency_ms = latency_ms if mode == "only_edge" else 0.0
@@ -588,13 +629,19 @@ class Scheduler:
         while True:
             method_frame, header_frame, body = self.channel.basic_get(queue=f"queue_{self.client_id}", auto_ack=True)
             if method_frame and body:
+                # `pipeline` starts the moment the batch became available to this
+                # device. With no in-process hand-off queue that is also when
+                # compute starts, so pipeline == service here; add a hand-off
+                # thread and the two diverge on their own (04 §2.2).
+                ready_ns = time.time_ns()
                 with open(self._timing_log_cloud, "a") as _tf:
-                    print(str(time.time_ns()) + " get input", file=_tf)
+                    print(str(ready_ns) + " get input", file=_tf)
                 batch_start = time.perf_counter()
                 received_message_size = len(body)
                 received_data = pickle.loads(body)
                 y = received_data["data"]
                 edge_start_time = y.get("edge_start_time", time.time())
+                self.cluster = y.get("cluster") or self.cluster   # group tag rides the batch
 
                 if compress["enable"]:
                     y["data"] = Decoder(y["data"], y["shape"])
@@ -612,12 +659,18 @@ class Scheduler:
                     self._send_fps_done()
 
                 batch_end = time.perf_counter()
+                output_ns = time.time_ns()
                 with open(self._timing_log_cloud, "a") as _tf:
-                    print(str(time.time_ns()) + " output", file=_tf)
-                cloud_end_wall = time.time()
+                    print(str(output_ns) + " output", file=_tf)
+                cloud_end_wall = output_ns / 1e9
+                self._pipeline_ms.append((output_ns - ready_ns) / 1e6)
                 latency_ms = (batch_end - batch_start) * 1000
                 fps = batch_size / (batch_end - prev_batch_end) if prev_batch_end is not None else 0.0
+                # e2e spans two machines by definition, so it inherits any offset
+                # between their clocks — report it, but treat it as indicative.
+                # Only the COMPLETING tier reports it: one series per group.
                 e2e_latency_ms = (cloud_end_wall - edge_start_time) * 1000
+                self._e2e_ms.append(e2e_latency_ms)
                 ram_mb = self.get_ram_mb()
 
                 print(f"[Batch {batch_id:4d}] CLOUD | latency={latency_ms:.1f}ms | "
@@ -676,12 +729,14 @@ class Scheduler:
         while True:
             method_frame, header_frame, body = self.channel.basic_get(queue=f"queue_{self.client_id}", auto_ack=True)
             if method_frame and body:
+                ready_ns = time.time_ns()          # see last_layer: pipeline start
                 with open(self._timing_log_cloud, "a") as _tf:
-                    print(str(time.time_ns()) + " get input", file=_tf)
+                    print(str(ready_ns) + " get input", file=_tf)
                 batch_start = time.perf_counter()
                 received_message_size = len(body)
                 received_data = pickle.loads(body)
                 y = received_data["data"]
+                self.cluster = y.get("cluster") or self.cluster   # group tag rides the batch
 
                 if compress["enable"]:
                     y["data"] = Decoder(y["data"], y["shape"])
@@ -698,13 +753,18 @@ class Scheduler:
                     # "width": received_data["width"],
                     # "height": received_data["height"],
                     "edge_start_time": received_data["data"]["edge_start_time"],
+                    "cluster": self.cluster,
                 }
                 print(f"[DEBUG] middle_layer sending to queue: {next_client_id}")
                 self.send_next_layer(f"queue_{next_client_id}", y_msg, compress)
                 batch_end = time.perf_counter()
+                output_ns = time.time_ns()
                 with open(self._timing_log_cloud, "a") as _tf:
-                    print(str(time.time_ns()) + " output", file=_tf)
-                cloud_end_wall = time.time()
+                    print(str(output_ns) + " output", file=_tf)
+                cloud_end_wall = output_ns / 1e9
+                # A middle tier does not complete the batch, so it reports no
+                # e2e series — that belongs to the completing tier alone.
+                self._pipeline_ms.append((output_ns - ready_ns) / 1e6)
                 latency_ms = (batch_end - batch_start) * 1000
                 fps = batch_size / (batch_end - prev_batch_end) if prev_batch_end is not None else 0.0
                 e2e_latency_ms = latency_ms if mode == "only_edge" else 0.0
