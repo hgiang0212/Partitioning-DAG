@@ -1,5 +1,8 @@
 import pika
 import uuid
+import json
+import os
+import sys
 import argparse
 import yaml
 import torch
@@ -11,8 +14,45 @@ from src.Scheduler import Scheduler
 parser = argparse.ArgumentParser(description="Split learning framework")
 parser.add_argument('--layer_id', type=int, required=True, help='ID of layer, start from 1')
 parser.add_argument('--device', type=str, required=False, help='Device of client')
-parser.add_argument('--client_id', type=int, required=False, help='ID of client')
+parser.add_argument('--client_id', type=int, required=False,
+                    help='ID of client; defaults to "client_id" in setup.json')
 args = parser.parse_args()
+
+# ── Per-machine identity ─────────────────────────────────────────────────────
+# setup.json holds THIS device's client_id, so a client is started with only its
+# stage:  python client.py --layer_id 1
+# It is deliberately not in config.yaml: that file is the RUN's configuration and
+# is the same on every machine (guide/README invariant 9), while the id is the one
+# value that must differ per device — it names this client's reply queue
+# (reply_<client_id>) and is how the server registers it. Two clients sharing an id
+# share a reply queue and the run silently misroutes.
+# --client_id still wins when given, for running several clients on one machine.
+SETUP_PATH = 'setup.json'
+
+
+def load_client_id(cli_client_id):
+    if cli_client_id is not None:
+        return cli_client_id
+    if not os.path.exists(SETUP_PATH):
+        sys.exit(f"[!] No --client_id given and no {SETUP_PATH} in {os.getcwd()}.\n"
+                 f"    Create it with:  {{\"client_id\": 1}}")
+    try:
+        with open(SETUP_PATH, 'r') as f:
+            setup = json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        sys.exit(f"[!] Cannot read {SETUP_PATH}: {e}")
+    if setup.get("client_id") is None:
+        sys.exit(f"[!] {SETUP_PATH} has no \"client_id\" field.")
+    try:
+        return int(setup["client_id"])
+    except (TypeError, ValueError):
+        sys.exit(f"[!] {SETUP_PATH}: client_id must be an integer, "
+                 f"got {setup['client_id']!r}")
+
+
+client_id = load_client_id(args.client_id)
+print(f"Using client_id: {client_id} "
+      f"({'--client_id' if args.client_id is not None else SETUP_PATH})")
 
 with open('config.yaml', 'r') as file:
     config = yaml.safe_load(file)
@@ -45,11 +85,11 @@ channel = connection.channel()
 
 if __name__ == "__main__":
     src.Log.print_with_color("[>>>] Client sending registration message to server...", "red")
-    data = {"action": "REGISTER", "client_id": args.client_id, "layer_id": args.layer_id, "message": "Hello from Client!"}
-    scheduler = Scheduler(args.client_id, args.layer_id, channel, device)
-    logger.log_debug(f"client_id : {args.client_id} , stage {args.layer_id} , "
+    data = {"action": "REGISTER", "client_id": client_id, "layer_id": args.layer_id, "message": "Hello from Client!"}
+    scheduler = Scheduler(client_id, args.layer_id, channel, device)
+    logger.log_debug(f"client_id : {client_id} , stage {args.layer_id} , "
                      f"channel {channel} , device {device}")
-    client = RpcClient(args.client_id, args.layer_id, channel ,logger ,scheduler.inference_func, device,
+    client = RpcClient(client_id, args.layer_id, channel ,logger ,scheduler.inference_func, device,
                        configure_func=scheduler.configure_measurements)
     client.send_to_server(data)
     client.wait_response()

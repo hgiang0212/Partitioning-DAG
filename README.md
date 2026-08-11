@@ -121,7 +121,8 @@ split_inference/
 │
 ├── client.py          # Edge or tail inference node
 ├── server.py          # Central controller
-├── config.yaml        # System configuration
+├── config.yaml        # System configuration (same on every machine)
+├── setup.json         # This machine's client_id (differs per device)
 ├── requirements.txt   # Python dependencies
 │
 ├── imgs/              # Images used in README
@@ -224,7 +225,23 @@ python server.py
 
 ---
 
-## Step 2 – Start Clients
+## Step 2 – Set this machine's ID
+
+Each device needs a **unique** `client_id`. Put it in `setup.json` on that machine:
+
+```json
+{
+  "client_id": 1
+}
+```
+
+It names the client's reply queue (`reply_<client_id>`) and is how the server
+registers it, so two devices must never share one. This is the only file that
+differs per machine — `config.yaml` is identical everywhere.
+
+---
+
+## Step 3 – Start Clients
 
 Edge device:
 
@@ -242,6 +259,13 @@ Tail device:
 
 ```bash
 python client.py --layer_id 2
+```
+
+To run several clients on one machine, override the file per process:
+
+```bash
+python client.py --layer_id 1 --client_id 1
+python client.py --layer_id 2 --client_id 2
 ```
 
 ---
