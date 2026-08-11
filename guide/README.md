@@ -10,9 +10,7 @@ every other project's — same filenames, same line formats, same charts, same c
 > **Scope.** Throughput, latency, device utilization, and — optionally — free time
 > ([10](10-free-time.md)): how much of each device and each machine was idle, the RAM
 > of an infrastructure host you run no code on ([11](11-broker-ram.md)), and the size of
-> the payload a worker puts on the wire ([12](12-message-size.md)), and — the one control
-> mechanism here rather than a measurement — a bound on how much of that host's memory a
-> run may take ([13](13-broker-guard.md)).
+> the payload a worker puts on the wire ([12](12-message-size.md)).
 > Model-accuracy metrics
 > (mAP and friends) are deliberately **out of scope** — nothing here depends on
 > ground-truth labels or a detection task. The pipeline being measured can be doing
@@ -45,9 +43,7 @@ that is the entire point of fixing the format.
 ├── broker_ram_ns.log         infra-host RAM over the run   one line per sample (optional)
 ├── broker_ram.log            infra-host RAM summary        BROKER/USED/DELTA lines (optional)
 ├── message_size.log          payload size summary          one line per measured worker (optional)
-├── message_size_series.log   payload size over the run     one line per published message (optional)
-├── broker_guard_ns.log       infra-host limit events       one line per event (optional)
-└── broker_guard.log          infra-host limit summary      GUARD/BROKER/QUEUE/THROTTLE (optional)
+└── message_size_series.log   payload size over the run     one line per published message (optional)
 ```
 
 ---
@@ -69,7 +65,6 @@ that is the entire point of fixing the format.
 | 10 | [free-time.md](10-free-time.md) | measuring how much of the fleet was idle (optional) |
 | 11 | [broker-ram.md](11-broker-ram.md) | measuring an infrastructure host you run no code on (optional) |
 | 12 | [message-size.md](12-message-size.md) | measuring the bytes a worker puts on the wire (optional) |
-| 13 | [broker-guard.md](13-broker-guard.md) | **limiting** that host's memory rather than only measuring it (optional) |
 
 **If you are producing results:** 01 → 02 → 03 → 04 → 05 → 09.
 **If you are visualizing existing results:** 01 → 06 → 07 → 08 → 09.
