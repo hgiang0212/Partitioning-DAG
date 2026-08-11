@@ -31,6 +31,26 @@ md = lambda s: cells.append(nbf.v4.new_markdown_cell(s.strip("\n")))
 code = lambda s: cells.append(nbf.v4.new_code_cell(s.strip("\n")))
 
 
+def guarded_code(condition, reason, body):
+    """Emit a chart cell that skips itself, with a reason, when its source frame
+    is empty.
+
+    A chart drawn from no rows is not an empty chart — it is a titled axis with a
+    legend and a `0.0 … 1.2` scale, which reads as a measured zero rather than as
+    missing data, and `finish()` writes it to `imgs/` and counts it in the
+    manifest all the same. The optional families (10-14) already refuse to draw
+    on absent input; the six required ones (01-08) must refuse on the same terms
+    (guide/07 C9: skip it rather than ship an empty one, and say so).
+
+    The guard is applied here, at build time, so the chart bodies below stay
+    exactly as they read in guide/07 — one wrapper instead of eight hand-indented
+    copies of the same `if/else`.
+    """
+    indented = "\n".join("    " + line if line.strip() else line
+                         for line in body.strip("\n").splitlines())
+    code(f"if {condition}:\n    print({reason!r})\nelse:\n{indented}")
+
+
 # ─────────────────────────────── cell 0 ──────────────────────────────────────
 md(rf"""
 # Split Inference — Distributed Run Results
@@ -712,7 +732,8 @@ md("""
 correctly shows one bar. **Cluster bars do not sum to the System bar** and should
 not be expected to — each cluster divides by its own span.
 """)
-code(r'''
+guarded_code("not len(df_rate)",
+             "group_rate.log has no rows — 01 skipped.", r'''
 n_panels = max(len(RUN_ORDER), 1)
 fig, axes = plt.subplots(1, n_panels, figsize=(7.6 * n_panels, 4.9), sharey=True)
 axes = np.atleast_1d(axes)
@@ -758,7 +779,8 @@ The raw reading is noisy, so a 31-reading centred mean carries the trend and the
 raw series recedes behind it. The first `W-1 = 15` batches carry no `window_fps`,
 so the line legitimately starts a little after t=0 (01 §3.1).
 """)
-code(r'''
+guarded_code("not len(df_batch)",
+             "batch_done_ns.log has no windowed rows — 02 skipped.", r'''
 n_panels = max(len(RUN_ORDER), 1)
 fig, axes = plt.subplots(n_panels, 1, figsize=(13, 4.4 * n_panels), sharex=False)
 axes = np.atleast_1d(axes)                      # each run has its own duration
@@ -813,7 +835,8 @@ md("""
 window later than the system does, and clusters end at different times — both are
 correct, not truncated series.
 """)
-code(r'''
+guarded_code("not len(df_tl)",
+             "group_rate_ns.log has no windowed rows — 03 skipped.", r'''
 n_panels = max(len(RUN_ORDER), 1)
 fig, axes = plt.subplots(n_panels, 1, figsize=(13, 3.9 * n_panels), sharex=False)
 axes = np.atleast_1d(axes)
@@ -855,7 +878,8 @@ md("""
 A high mean with a wide box is a worse result than a slightly lower mean with a
 tight one.
 """)
-code(r'''
+guarded_code("not len(df_tl)",
+             "group_rate_ns.log has no windowed rows — 04 skipped.", r'''
 fig, ax = plt.subplots(figsize=(9.0, 4.9))
 
 positions, data, colors = [], [], []
@@ -914,7 +938,8 @@ panel is honestly its own scale and the panel titles say which is which.
 `kind=service` is charted, not `pipeline` — `pipeline` measures buffering, not
 device speed (04 §2.2).
 """)
-code(r'''
+guarded_code('not (df_lat.kind == "service").any()',
+             "latency_group.log has no kind=service rows — 05 skipped.", r'''
 svc = df_lat[df_lat.kind == "service"]
 panel_roles = ROLES or ["all"]
 # One x slot per cluster, or per cluster x run when several runs are loaded.
@@ -966,7 +991,8 @@ md("""
 `kind=e2e`. **Indicative, not exact** — `e2e` spans two machines by definition and
 inherits any offset between their clocks (04 §2.3).
 """)
-code(r'''
+guarded_code('not (df_lat.kind == "e2e").any()',
+             "latency_group.log has no kind=e2e rows — 06 skipped.", r'''
 e2e = df_lat[df_lat.kind == "e2e"]
 stats  = [("mean_ms", "Mean"), ("p50_ms", "p50"), ("p95_ms", "p95"), ("max_ms", "Max")]
 scopes = [s for s in SCOPES if (e2e.scope == s).any()]
@@ -1012,7 +1038,8 @@ md("""
 Pooled `utilization` (Σbusy / Σtotal). Where it diverges from `utilization_mean`,
 the group is imbalanced (03 §6) — both are annotated on the `ALL` rows.
 """)
-code(r'''
+guarded_code("not len(df_utg)",
+             "utilization_group.log has no rows — 07 skipped.", r'''
 rows, labels = [], []
 for g in GROUPS:
     for r in ROLES:
@@ -1091,7 +1118,8 @@ md("""
 Hunting stragglers. A bar above 100% would be a **measurement bug**, not a fast
 device (03 §2.1) — it is deliberately not clipped.
 """)
-code(r'''
+guarded_code("not len(df_utd)",
+             "utilization.log has no rows — 08 skipped.", r'''
 n_panels = max(len(RUN_ORDER), 1)
 fig, axes = plt.subplots(1, n_panels, figsize=(max(11, 0.9 * len(df_utd)) if n_panels == 1
                                               else 7.4 * n_panels, 4.9), sharey=True)
