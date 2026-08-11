@@ -172,3 +172,23 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# ── Run results (guide/05-archiving.md) ──────────────────────────────────────
+# The blanket `*.log` rule above is right for the LIVE logs at the repo root —
+# every run truncates those. It is wrong for the archive: results/<run-id>/ is
+# one immutable run, it is what the notebook reads, and it is the deliverable.
+!results/**/*.log
+
+# Per-device scratch, not results (guide/05 §5): superseded by the pooled logs,
+# and a leftover copy silently poisons the next run's numbers.
+metrics_raw_*.csv
+metrics_pivoted*.csv
+metrics_pivot.lock
+timing_edge_*.log
+timing_cloud_*.log
+message_size_*.log
+
+# Fabricated run used to exercise the validators and the notebook before real
+# results exist (scratch/make_synthetic_run.py). Regenerable, and it must never
+# be mistaken for a measurement.
+scratch/synthetic/

@@ -8,3 +8,6 @@ opencv-python
 ultralytics
 psutil
 torchmetrics
+paramiko          # guide/11: one long-lived ssh session to the queue host.
+                  # Optional — without it broker_ram falls back to the management
+                  # API and labels every line source=rabbitmq_api.

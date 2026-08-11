@@ -7,11 +7,17 @@ import torch
 import src.Log as Log
 
 class RpcClient:
-    def __init__(self, client_id, layer_id, channel, logger ,inference_func, device):
+    def __init__(self, client_id, layer_id, channel, logger ,inference_func, device,
+                 configure_func=None):
         self.client_id = client_id
         self.layer_id = layer_id
         self.logger = logger
         self.inference_func = inference_func
+        # Every runtime setting reaches this worker through the dispatch message
+        # and nothing is read from its own config file at run time
+        # (guide/README invariant 9). This hook hands the message to the
+        # scheduler so the optional measurements can be armed from it.
+        self.configure_func = configure_func
         self.device = device
 
         self.channel = channel
@@ -33,6 +39,11 @@ class RpcClient:
         action = self.response["action"]
 
         if action == "START":
+            if self.configure_func is not None:
+                try:
+                    self.configure_func(self.response)
+                except Exception as e:      # telemetry never kills the run
+                    Log.print_with_color(f"[Measure] configure failed: {e}", "yellow")
             model_name = self.response["model_name"]
             num_layers = self.response["num_layers"]
             num_layers_model = self.response["num_layers_model"]

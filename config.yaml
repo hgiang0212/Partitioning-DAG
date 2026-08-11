@@ -34,3 +34,36 @@ archive:                  # guide/05-archiving.md — makes runs comparable week
   enabled: True
   path: results           # results/results_<MMDD>_<HHMM>_<tag>/
   config_path: config.yaml  # archived beside the numbers; without it they are unreadable in a month
+
+# ── Optional measurements ────────────────────────────────────────────────────
+# Every flag below lives ONLY here and travels to the workers in the dispatch
+# message (guide/README invariant 9). No worker reads any of them from its own
+# copy of this file, so a measurement setting cannot drift across machines and
+# silently mix two configurations into one run. Turning one off also skips the
+# server's own writer for it (invariant 10); its files stay present but empty.
+
+free_time:                # guide/10 — wall clock in which a device did NOTHING
+  enabled: True
+  bucket_s: 1.0           # width of one free_time_series.log bucket
+  max_intervals: 4000     # cap on the busy intervals shipped for the machine union;
+                          # closing the smallest gaps first, reported as merge_slop_s
+
+message_size:             # guide/12 — bytes one worker puts on the wire
+  enabled: True
+  max_series: 2000        # shipped series is decimated EVENLY to this; the summary
+                          # statistics still use every sample
+  mode: split             # context recorded beside the size, so it is reproducible
+
+broker_ram:               # guide/11 — RAM of the queue host, which runs no code of ours
+  enabled: False          # needs HOST login credentials below; falls back to the
+                          # management API (broker process, not host) and labels it
+  interval_s: 1.0
+  tail_s: 2.0             # keep sampling this long past the drain — a curve that does
+                          # not fall there means something is still holding batches
+  max_run_s: 7200         # bounds the remote loop so an orphaned sampler cannot
+                          # outlive the run on the infrastructure host
+  ssh:
+    host: 192.168.101.91
+    port: 22
+    username: ""          # the MACHINE's login, not RabbitMQ's application credentials
+    password: ""

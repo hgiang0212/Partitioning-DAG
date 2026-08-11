@@ -3,6 +3,7 @@ import cv2
 import pickle
 from tqdm import tqdm
 import copy
+import socket
 import time
 import csv
 import os
@@ -11,6 +12,7 @@ import numpy as np
 
 from src.Compress import Encoder, Decoder
 import src.Log as Log
+from src.Measure import FreeTimeTracker, MessageSizeRecorder
 from src.Model import inference, postprocess_yolo
 
 
@@ -55,6 +57,13 @@ class Scheduler:
         # pools these and reduces once.
         self._pipeline_ms = []
         self._e2e_ms = []
+        # Optional measurements (guide/10, guide/12). Both are configured ONLY
+        # from the dispatch message in `configure_measurements` — a worker that
+        # read a measurement flag from its own config file would be one stale
+        # copy away from a run that silently mixes two configurations
+        # (guide/README invariant 9). Until then they are inert.
+        self.free_time = FreeTimeTracker(enabled=False)
+        self.msg_size = MessageSizeRecorder(enabled=False)
         self.size_message = None
         self.splits = None
         self.map_metric = None
@@ -63,6 +72,38 @@ class Scheduler:
         self._load_gt_dict()
 
     # ──────────────────────────── Measurement helpers ────────────────────────
+
+    def configure_measurements(self, response):
+        """Arm the optional measurements from the DISPATCH MESSAGE, never from a
+        local file (guide/README invariant 9).
+
+        `measure_message_size` is true on exactly one worker per run — the first
+        registered at the first stage — and the server is what decides that. A
+        worker that self-selected could leave a run where every edge measured or
+        none did, and the summary line looks identical either way (guide/12 §1).
+        """
+        ft_cfg = response.get("free_time") or {}
+        self.free_time = FreeTimeTracker(
+            enabled=bool(ft_cfg.get("enabled", False)),
+            bucket_s=float(ft_cfg.get("bucket_s", 1.0)),
+            max_intervals=int(ft_cfg.get("max_intervals", 4000)))
+
+        ms_cfg = response.get("message_size") or {}
+        cid_short = str(self.client_id).replace('-', '')[:12]
+        self.msg_size = MessageSizeRecorder(
+            enabled=bool(response.get("measure_message_size", False)),
+            path=f"message_size_{cid_short}.log",
+            max_series=int(ms_cfg.get("max_series", 2000)))
+        if self.msg_size.enabled:
+            Log.print_with_color(
+                f"[MsgSize] this worker is the one measuring payload size", "green")
+        # Context that DETERMINES the size — a size without it is unreproducible.
+        self._ms_context = {
+            "mode": ms_cfg.get("mode", "split"),
+            "compress": "on" if (response.get("compress") or {}).get("enable") else "off",
+            "num_bit": (response.get("compress") or {}).get("num_bit", 0),
+            "batch_size": response.get("batch_size", 0),
+        }
 
     def _send_fps_done(self):
         """Publish exactly one completion per finished batch, tagged with the
@@ -131,14 +172,27 @@ class Scheduler:
 
     def _send_utilization(self, stats):
         """Publish the report to utilization_queue (03 §4, 04 §3). Raw latency
-        arrays ride along with it — never pre-reduced percentiles.
+        arrays, the free-time report (10 §3) and the message-size report (12 §3)
+        ride along with it — never pre-reduced percentiles.
+
+        One queue, one drain: the reports sit on the broker until the server's
+        shutdown collection picks them up, so publisher and consumer never need
+        to be alive at the same moment. A second queue would buy nothing and
+        cost the server a second timeout.
+
         Telemetry only — every failure degrades to a warning, never an exception."""
         if stats is None:
-            return
-        message = {"action": "UTILIZATION", "client_id": self.client_id,
-                   "layer_id": self.layer_id, "cluster": self.cluster,
+            stats = {}
+        free_time = self.free_time.finish()      # None when the tracker is off:
+        message = {"action": "UTILIZATION", "client_id": self.client_id,   # a
+                   "layer_id": self.layer_id, "cluster": self.cluster,     # disabled
+                   "device": str(self.device),                             # tracker
                    "pipeline_ms": self._pipeline_ms, "e2e_ms": self._e2e_ms,
+                   "free_time": free_time,       # reports NOTHING, never zeros
+                   "message_size": self._message_size_report(),
                    **stats}
+        if not stats and free_time is None and message["message_size"] is None:
+            return                               # nothing worth a publish
         body = pickle.dumps(message)
         try:
             self.channel.queue_declare(queue=self.utilization_queue, durable=False)
@@ -160,6 +214,29 @@ class Scheduler:
                 connection.close()
             except Exception as e:
                 Log.print_with_color(f"[Utilization] send failed: {e}", "red")
+
+    @staticmethod
+    def _kv_safe(value):
+        """A `key=value` value MUST contain no spaces (01 §1) — the universal
+        parser splits on whitespace, so `splits=(11, 15)` silently truncates to
+        `splits=(11,` and the rest of the line's keys shift. Tuples are the easy
+        way to trip over this."""
+        text = "-".join(str(v) for v in value) if isinstance(value, (tuple, list)) \
+            else str(value)
+        return "_".join(text.split()) or "none"
+
+    def _message_size_report(self):
+        """Summary over every sample this worker took, with the context that
+        determines the size (12 §4). Returns None on every non-measuring worker."""
+        context = getattr(self, "_ms_context", None) or {}
+        return self.msg_size.report({
+            "client": self._kv_safe(self.client_id),
+            "role": "edge" if self.layer_id == 1 else "cloud",
+            "machine": self._kv_safe(socket.gethostname()),
+            "cluster": self._kv_safe(self.cluster),
+            "splits": self._kv_safe(self.splits),
+            **{k: self._kv_safe(v) for k, v in context.items()},
+        })
 
     def get_ram_mb(self):
         try:
@@ -455,7 +532,8 @@ class Scheduler:
 
     # ──────────────────────────── Pipeline ───────────────────────────────────
 
-    def send_next_layer(self, intermediate_queue, data, compress):
+    def send_next_layer(self, intermediate_queue, data, compress, batch_id=0):
+        t_encode = self.free_time.now()
         if compress["enable"]:
             data["data"] = [t.cpu().numpy() if isinstance(t, torch.Tensor) else None for t in
                             data["data"]]
@@ -468,15 +546,25 @@ class Scheduler:
             "data": data
         })
         self.size_message = len(message)
-        
+        self.free_time.add_work("encode", t_encode)
+
+        # The SERIALIZED byte count handed to the transport, recorded BEFORE the
+        # publish call (12 §2). Both orderings look equivalent until the broker
+        # hits its high-water mark and stops accepting — which is exactly the run
+        # this measurement exists to explain, and the one where measuring after
+        # the call writes the sample late or, if it raises, never.
+        self.msg_size.record(self.size_message, batch_id)
+
         # Log message size
         Log.print_with_color(f"[>>>] Sending message to {intermediate_queue}: {self.size_message} bytes", "yellow")
-        
+
+        t_send = self.free_time.now()
         self.channel.basic_publish(
             exchange='',
             routing_key=intermediate_queue,
             body=message,
         )
+        self.free_time.add_work("send", t_send)
 
     def send_to_server(self, message):
         self.channel.queue_declare('rpc_queue', durable=False)
@@ -506,13 +594,18 @@ class Scheduler:
 
         with open(self._timing_log_edge, "w") as _tf:
             print(str(time.time_ns()) + " start", file=_tf)
+        # Free time opens on the SAME window as utilization's start/end, so the
+        # two describe the same run span and can be read against each other.
+        self.free_time.start()
         pbar = tqdm(desc="Processing video (while loop)", unit="frame")
         batch_id = 0
         prev_batch_end = None
         batch_first_frame_ns = None
         while True:
+            t_capture = self.free_time.now()
             ret, frame = cap.read()
             if not ret:
+                self.free_time.add_work("capture", t_capture)
                 break
             if not input_image:
                 # `pipeline` starts here, not at `get input`: the first frame of
@@ -525,6 +618,7 @@ class Scheduler:
             frame = frame.astype('float32') / 255.0
             tensor = torch.from_numpy(frame).permute(2, 0, 1)  # shape: (3, 640, 640)
             input_image.append(tensor)
+            self.free_time.add_work("capture", t_capture)
 
             if len(input_image) == batch_size:
                 with open(self._timing_log_edge, "a") as _tf:
@@ -532,12 +626,14 @@ class Scheduler:
                 batch_start = time.perf_counter()
                 edge_start_wall = time.time()
 
+                t_infer = self.free_time.now()
                 input_image = torch.stack(input_image)
                 input_image = input_image.to(self.device)
 
                 y = []
                 x, y = inference(model, input_image, y, 0)
                 y[-1] = x
+                self.free_time.add_work("inference", t_infer)
 
                 y_msg = {
                     "data": y,
@@ -546,13 +642,14 @@ class Scheduler:
                     "edge_start_time": edge_start_wall,
                     "cluster": self.cluster,
                 }
-                self.send_next_layer(f"queue_{next_client_id}", y_msg, compress)
+                self.send_next_layer(f"queue_{next_client_id}", y_msg, compress, batch_id)
 
                 if mode == "only_edge":      # edge completes the batch only in this mode
                     self._send_fps_done()
 
                 batch_end = time.perf_counter()
                 output_ns = time.time_ns()
+                t_book = self.free_time.now()
                 with open(self._timing_log_edge, "a") as _tf:
                     print(str(output_ns) + " output", file=_tf)
                 if batch_first_frame_ns is not None:
@@ -587,18 +684,21 @@ class Scheduler:
                 input_image = []
                 orig_images = []
                 pbar.update(batch_size)
+                self.free_time.add_work("bookkeeping", t_book)
             else:
                 continue
 
         print(f'size message: {self.size_message} bytes.')
         with open(self._timing_log_edge, "a") as _tf:
             print(str(time.time_ns()) + " end", file=_tf)
+        self.free_time.stop()          # same window as `end` in the timing log
         print(f'size message: {self.size_message} bytes.')
 
         cap.release()
         pbar.close()
 
-        # utilization: computed from own log, sent BEFORE NOTIFY (guide §4)
+        # utilization: computed from own log, sent BEFORE NOTIFY (guide §4).
+        # The free-time and message-size reports ride along with it.
         self._send_utilization(self._compute_utilization(self._timing_log_edge, "edge"))
 
         notify_data = {"action": "NOTIFY", "client_id": self.client_id, "layer_id": self.layer_id,
@@ -626,9 +726,16 @@ class Scheduler:
         prev_batch_end = None
         with open(self._timing_log_cloud, "w") as _tf:
             print(str(time.time_ns()) + " start", file=_tf)
+        self.free_time.start()
         while True:
+            # Retroactive classification (10 §2): a non-blocking get is WORK when
+            # it yields a batch and FREE when the queue was empty, and which one
+            # it was is only known after it returns. Take the timestamp before
+            # the call, decide after.
+            t_poll = self.free_time.now()
             method_frame, header_frame, body = self.channel.basic_get(queue=f"queue_{self.client_id}", auto_ack=True)
             if method_frame and body:
+                self.free_time.add_work("recv", t_poll)
                 # `pipeline` starts the moment the batch became available to this
                 # device. With no in-process hand-off queue that is also when
                 # compute starts, so pipeline == service here; add a hand-off
@@ -638,6 +745,7 @@ class Scheduler:
                     print(str(ready_ns) + " get input", file=_tf)
                 batch_start = time.perf_counter()
                 received_message_size = len(body)
+                t_decode = self.free_time.now()
                 received_data = pickle.loads(body)
                 y = received_data["data"]
                 edge_start_time = y.get("edge_start_time", time.time())
@@ -648,18 +756,27 @@ class Scheduler:
                     y["data"] = [torch.from_numpy(t) if t is not None else None for t in y["data"]]
 
                 y["data"] = [t.to(self.device) if t is not None else None for t in y["data"]]
+                self.free_time.add_work("decode", t_decode)
+
+                t_infer = self.free_time.now()
                 list_output = y["data"]
                 x = list_output[-1]
                 x, _ = inference(model, x, list_output, splits)
+                self.free_time.add_work("inference", t_infer)
 
+                t_post = self.free_time.now()
                 results = postprocess_yolo(x)
                 self._update_map(results, batch_id, batch_size)
+                self.free_time.add_work("postprocess", t_post)
 
                 if mode != "only_edge":      # cloud completes the batch in split / only_cloud
+                    t_done = self.free_time.now()
                     self._send_fps_done()
+                    self.free_time.add_work("send", t_done)
 
                 batch_end = time.perf_counter()
                 output_ns = time.time_ns()
+                t_book = self.free_time.now()
                 with open(self._timing_log_cloud, "a") as _tf:
                     print(str(output_ns) + " output", file=_tf)
                 cloud_end_wall = output_ns / 1e9
@@ -694,7 +811,7 @@ class Scheduler:
                 batch_id += 1
                 prev_batch_end = batch_end
                 pbar.update(batch_size)
-
+                self.free_time.add_work("bookkeeping", t_book)
 
             else:
                 broadcast_queue_name = f'reply_{self.client_id}'
@@ -704,11 +821,18 @@ class Scheduler:
                     Log.print_with_color(f"[<<<] Received message from server {received_data}", "blue")
                     if received_data["action"] == "STOP":
                         Log.print_with_color("[>>>] Finish!", "red")
+                        # The stretch since the empty get was spent waiting for a
+                        # STOP that has now arrived — free, not busy.
+                        self.free_time.add_wait("stop", t_poll)
                         break
                 else:
                     time.sleep(0.5)
+                # The empty get, the control poll and the sleep are ONE idle
+                # stretch, recorded as a single interval rather than three.
+                self.free_time.add_wait("input", t_poll)
         with open(self._timing_log_cloud, "a") as _tf:
             print(str(time.time_ns()) + " end", file=_tf)
+        self.free_time.stop()
         self._send_utilization(self._compute_utilization(self._timing_log_cloud, "cloud"))
         try:
             cv2.destroyAllWindows()
@@ -723,17 +847,21 @@ class Scheduler:
         self.channel.basic_qos(prefetch_count=10)
         with open(self._timing_log_cloud, "w") as _tf:
             print(str(time.time_ns()) + " start", file=_tf)
+        self.free_time.start()
         pbar = tqdm(desc="Processing video (while loop)", unit="frame")
         batch_id = 0
         prev_batch_end = None
         while True:
+            t_poll = self.free_time.now()          # see last_layer: retroactive
             method_frame, header_frame, body = self.channel.basic_get(queue=f"queue_{self.client_id}", auto_ack=True)
             if method_frame and body:
+                self.free_time.add_work("recv", t_poll)
                 ready_ns = time.time_ns()          # see last_layer: pipeline start
                 with open(self._timing_log_cloud, "a") as _tf:
                     print(str(ready_ns) + " get input", file=_tf)
                 batch_start = time.perf_counter()
                 received_message_size = len(body)
+                t_decode = self.free_time.now()
                 received_data = pickle.loads(body)
                 y = received_data["data"]
                 self.cluster = y.get("cluster") or self.cluster   # group tag rides the batch
@@ -743,10 +871,14 @@ class Scheduler:
                     y["data"] = [torch.from_numpy(t) if t is not None else None for t in y["data"]]
 
                 y["data"] = [t.to(self.device) if t is not None else None for t in y["data"]]
+                self.free_time.add_work("decode", t_decode)
+
+                t_infer = self.free_time.now()
                 list_output = y["data"]
                 x = list_output[-1]
                 x, y = inference(model, x, list_output, splits)
                 y[-1] = x
+                self.free_time.add_work("inference", t_infer)
 
                 y_msg = {
                     "data": y,
@@ -756,9 +888,10 @@ class Scheduler:
                     "cluster": self.cluster,
                 }
                 print(f"[DEBUG] middle_layer sending to queue: {next_client_id}")
-                self.send_next_layer(f"queue_{next_client_id}", y_msg, compress)
+                self.send_next_layer(f"queue_{next_client_id}", y_msg, compress, batch_id)
                 batch_end = time.perf_counter()
                 output_ns = time.time_ns()
+                t_book = self.free_time.now()
                 with open(self._timing_log_cloud, "a") as _tf:
                     print(str(output_ns) + " output", file=_tf)
                 cloud_end_wall = output_ns / 1e9
@@ -790,6 +923,7 @@ class Scheduler:
                 batch_id += 1
                 prev_batch_end = batch_end
                 pbar.update(batch_size)
+                self.free_time.add_work("bookkeeping", t_book)
             else:
                 broadcast_queue_name = f'reply_{self.client_id}'
                 method_frame, header_frame, body = self.channel.basic_get(queue=broadcast_queue_name, auto_ack=True)
@@ -798,12 +932,15 @@ class Scheduler:
                     Log.print_with_color(f"[<<<] Received message from server {received_data}", "blue")
                     if received_data["action"] == "STOP":
                         Log.print_with_color("[>>>] Finish!", "red")
+                        self.free_time.add_wait("stop", t_poll)
                         break
                 else:
                     time.sleep(0.5)
+                self.free_time.add_wait("input", t_poll)
 
         with open(self._timing_log_cloud, "a") as _tf:
             print(str(time.time_ns()) + " end", file=_tf)
+        self.free_time.stop()
         self._send_utilization(self._compute_utilization(self._timing_log_cloud, "cloud"))
         cv2.destroyAllWindows()
         pbar.close()

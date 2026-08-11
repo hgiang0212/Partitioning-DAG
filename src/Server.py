@@ -16,6 +16,8 @@ from requests.auth import HTTPBasicAuth
 from ultralytics import YOLO
 
 import src.Log
+from src.BrokerRam import BrokerRamSampler
+from src.Measure import clip_intervals, merge_intervals, total_length
 from src.PDD import evaluate_pdd_for_one_client
 
 
@@ -73,13 +75,27 @@ class Server:
         self.util_group_path    = f"{log_path}/utilization_group.log"
         self.latency_group_path = f"{log_path}/latency_group.log"
         self.events_path        = f"{log_path}/events_ns.log"
+        # Optional families, each all-its-files-or-none (01 §2):
+        self.free_time_path        = f"{log_path}/free_time.log"          # 10
+        self.free_time_group_path  = f"{log_path}/free_time_group.log"
+        self.free_time_series_path = f"{log_path}/free_time_series.log"
+        self.broker_ram_ns_path    = f"{log_path}/broker_ram_ns.log"      # 11
+        self.broker_ram_path       = f"{log_path}/broker_ram.log"
+        self.msg_size_path         = f"{log_path}/message_size.log"       # 12
+        self.msg_size_series_path  = f"{log_path}/message_size_series.log"
         self.result_files = [self.batch_log_path, self.group_rate_ns_path,
                              self.group_rate_path, self.util_log_path,
                              self.util_group_path, self.latency_group_path,
-                             self.events_path]
-        # Truncate ALL seven UNCONDITIONALLY, once, centrally, before any worker
-        # can write (01 §4). Conditional truncation is how a previous run's file
-        # leaks into this run's archive (05 §4).
+                             self.events_path,
+                             self.free_time_path, self.free_time_group_path,
+                             self.free_time_series_path,
+                             self.broker_ram_ns_path, self.broker_ram_path,
+                             self.msg_size_path, self.msg_size_series_path]
+        # Truncate ALL of them UNCONDITIONALLY, once, centrally, before any
+        # worker can write (01 §4) — including the optional ones, and including
+        # the ones this run's flags turn off. Conditional truncation is how a
+        # previous run's file leaks into this run's archive (05 §4), and an
+        # empty-but-present file is a valid "this run had none".
         for path in self.result_files:
             open(path, "w").close()
 
@@ -106,6 +122,39 @@ class Server:
         self.channel.queue_declare(queue="utilization_queue", durable=False)
         self.channel.queue_purge(queue="utilization_queue")   # drop stale reports from a crashed run
 
+        # ── Optional measurements (guide/10, 11, 12) ───────────────────────
+        # Every flag lives HERE, in the server's config, and travels to the
+        # workers in the dispatch message. Nothing below is ever read by a
+        # worker from its own config file (guide/README invariant 9), so a
+        # measurement setting can never drift across N machines and silently
+        # mix two configurations into one run.
+        ft_cfg = config.get("free_time") or {}
+        self._free_time_enabled = bool(ft_cfg.get("enabled", False))
+        self._free_time_dispatch = {
+            "enabled": self._free_time_enabled,
+            "bucket_s": float(ft_cfg.get("bucket_s", 1.0)),
+            "max_intervals": int(ft_cfg.get("max_intervals", 4000)),
+        }
+        ms_cfg = config.get("message_size") or {}
+        self._msg_size_enabled = bool(ms_cfg.get("enabled", False))
+        self._msg_size_dispatch = {
+            "enabled": self._msg_size_enabled,
+            "max_series": int(ms_cfg.get("max_series", 2000)),
+            "mode": ms_cfg.get("mode", "split"),
+        }
+        # Chosen by registration order, which the server already knows before it
+        # dispatches anything and which needs no configuration (12 §1).
+        self._msg_size_client = None
+
+        # The infra host's window opens HERE, at controller start — before any
+        # worker registers or anything is published — so the series contains the
+        # host at rest, which is the only thing that turns "this host was using
+        # N MB" into "running the system costs this host N MB" (11 §6).
+        self._broker_ram = BrokerRamSampler(
+            config.get("broker_ram"), self.address, self.username, self.password,
+            self.virtual_host, self.broker_ram_ns_path, self.broker_ram_path)
+        self._broker_ram.start()
+
         # ── Archiving (guide/05-archiving.md) ──────────────────────────────
         archive_cfg = config.get("archive") or {}
         self._archive_enabled = bool(archive_cfg.get("enabled", True))
@@ -122,6 +171,14 @@ class Server:
 
             if (int(client_id), layer_id) not in self.list_clients:
                 self.list_clients.append((int(client_id), layer_id))
+
+            # First worker to register at the FIRST tier measures payload size
+            # (12 §1). The first tier is the one whose output crosses the
+            # network, and every worker in a group publishes the same payload
+            # shape from the same split point — so nine workers measuring would
+            # produce one number nine times, at nine times the cost.
+            if layer_id == 1 and self._msg_size_client is None:
+                self._msg_size_client = int(client_id)
 
             src.Log.print_with_color(f"[<<<] Received message from client: {message}", "blue")
             self.register_clients[layer_id - 1] += 1
@@ -399,6 +456,11 @@ class Server:
                 "yellow")
         self._write_utilization_group(reports)
         self._write_latency_group(reports)
+        # Both optional families ride on the same reports and the same drain, so
+        # turning one off costs the shutdown nothing: there is no extra queue to
+        # poll and no extra timeout to burn (guide/README invariant 10).
+        self._write_free_time(reports)
+        self._write_message_size(reports)
 
     @staticmethod
     def _cluster_of(report):
@@ -514,6 +576,230 @@ class Server:
             src.Log.print_with_color(
                 f"[Latency] writing {self.latency_group_path} failed: {e}", "yellow")
 
+    # ──────────────────── Free time (guide/10-free-time.md) ──────────────────
+
+    def _write_free_time(self, reports):
+        """free_time.log, free_time_group.log and free_time_series.log (01 §3.8-3.10).
+
+        Free time is the wall clock in which a device did nothing AT ALL — no
+        input, no compute, no encode, no transfer, no bookkeeping. It is neither
+        utilization nor `1 - utilization`: utilization measures one lane's
+        `get input -> output` window, so a back-pressure wait inside that window
+        counts as busy there and free here, while work on another lane counts as
+        busy here and as nothing there. Both are emitted; neither derives from
+        the other."""
+        if not self._free_time_enabled:
+            return
+        devices = [(r, r.get("free_time")) for r in reports if r.get("free_time")]
+        if not devices:
+            src.Log.print_with_color(
+                "[FreeTime] enabled but no device reported — nothing written", "yellow")
+            return
+        t_ns = time.time_ns()
+        try:
+            self._write_free_time_devices(t_ns, devices)
+            self._write_free_time_group(t_ns, devices)
+            self._write_free_time_series(t_ns, devices)
+        except Exception as e:
+            src.Log.print_with_color(f"[FreeTime] writing failed: {e}", "yellow")
+
+    @staticmethod
+    def _kv_safe(value, default="unknown"):
+        """A `key=value` value MUST contain no spaces (01 §1): the universal
+        parser splits on whitespace, so one space shifts every key after it on
+        that line. Everything below crosses the wire from a worker, so it is
+        sanitized here as well as there — a shared file is the wrong place to
+        find out that a hostname had a space in it."""
+        text = "_".join(str(value).split()) if value is not None else ""
+        return text or default
+
+    @classmethod
+    def _ft_ident(cls, report, free_time):
+        return (cls._kv_safe(report.get("client_id")),
+                cls._kv_safe(report.get("role")),
+                cls._kv_safe(free_time.get("machine")),
+                cls._kv_safe(report.get("cluster")),
+                cls._kv_safe(report.get("device")))
+
+    def _write_free_time_devices(self, t_ns, devices):
+        lines = []
+        for report, ft in devices:
+            client, role, machine, cluster, device = self._ft_ident(report, ft)
+            span_s, free_s = ft["span_ns"] / 1e9, ft["free_ns"] / 1e9
+            host_idle = ft.get("host_idle")
+            # busy_s is the measure of the MERGED intervals, never a sum of
+            # per-stage timers: a sum can exceed span_s whenever two lanes
+            # overlap, which is normal for a pipelined device.
+            line = (f"{t_ns} client={client} role={role} machine={machine} "
+                    f"cluster={cluster} device={device} span_s={span_s:.3f} "
+                    f"busy_s={ft['busy_ns'] / 1e9:.3f} free_s={free_s:.3f} "
+                    f"free={100.0 * ft['free_ns'] / ft['span_ns']:.2f}% "
+                    f"gaps={ft['gaps']} "
+                    f"longest_free_ms={ft['longest_free_ns'] / 1e6:.3f}")
+            if host_idle is not None:
+                line += f" host_idle={host_idle:.2f}%"
+            lines.append(line)
+        with open(self.free_time_path, "w") as f:
+            f.write("\n".join(lines) + "\n")
+        src.Log.print_with_color(f"[FreeTime] {len(lines)} device line(s)", "green")
+
+    def _write_free_time_group(self, t_ns, devices):
+        def pooled(group):
+            free = sum(ft["free_ns"] for _, ft in group)
+            span = sum(ft["span_ns"] for _, ft in group)
+            mean = (sum(100.0 * ft["free_ns"] / ft["span_ns"] for _, ft in group)
+                    / len(group)) if group else 0.0
+            return free, span, (100.0 * free / span if span else 0.0), mean
+
+        by_cluster, by_machine = {}, {}
+        for report, ft in devices:
+            _, _, machine, cluster, _ = self._ft_ident(report, ft)
+            by_cluster.setdefault(cluster, []).append((report, ft))
+            by_machine.setdefault(machine, []).append((report, ft))
+
+        lines = []
+        for cluster, group in sorted(by_cluster.items()):
+            free, span, ratio, mean = pooled(group)
+            lines.append(f"{t_ns} cluster={cluster} ALL devices={len(group)} "
+                         f"free={ratio:.2f}% free_mean={mean:.2f}% "
+                         f"free_s={free / 1e9:.3f} span_s={span / 1e9:.3f}")
+            for role in sorted({r.get("role") or "unknown" for r, _ in group}):
+                sub = [(r, ft) for r, ft in group if (r.get("role") or "unknown") == role]
+                free_r, span_r, ratio_r, _ = pooled(sub)
+                lines.append(f"{t_ns} cluster={cluster} role={role} devices={len(sub)} "
+                             f"free={ratio_r:.2f}% free_s={free_r / 1e9:.3f} "
+                             f"span_s={span_r / 1e9:.3f}")
+            # Reasons sum to EXACTLY the scope's free time: attribution is
+            # priority-ordered on the device, so no moment is claimed twice, and
+            # whatever no reason covers is reported as `unaccounted` rather than
+            # quietly dropped.
+            reasons = {}
+            for _, ft in group:
+                for reason, value in (ft.get("reasons_ns") or {}).items():
+                    reasons[reason] = reasons.get(reason, 0) + value
+            for reason, value in sorted(reasons.items(), key=lambda kv: -kv[1]):
+                lines.append(f"{t_ns} cluster={cluster} FREE reason={reason} "
+                             f"free_s={value / 1e9:.3f} "
+                             f"share={(100.0 * value / free if free else 0.0):.2f}%")
+            # KIND shares MAY sum to more than 100%: per-kind sums overlap across
+            # lanes by construction. Only the merged busy_s above is exclusive.
+            kinds = {}
+            for _, ft in group:
+                for kind, value in (ft.get("kinds_ns") or {}).items():
+                    kinds[kind] = kinds.get(kind, 0) + value
+            for kind, value in sorted(kinds.items(), key=lambda kv: -kv[1]):
+                lines.append(f"{t_ns} cluster={cluster} KIND kind={kind} "
+                             f"busy_s={value / 1e9:.3f} "
+                             f"share={(100.0 * value / span if span else 0.0):.2f}%")
+
+        # MACHINE lines come from the UNION of the busy intervals of the device
+        # processes on that host, never from their ratios: two devices that are
+        # each 50% free can keep a machine 100% busy by interleaving. This is the
+        # one place device timestamps are compared, and it is valid for exactly
+        # one reason — processes on one host share a clock. Never across hosts.
+        for machine, group in sorted(by_machine.items()):
+            lo = min(ft["epoch_start_ns"] for _, ft in group)
+            hi = max(ft["epoch_end_ns"] for _, ft in group)
+            busy = merge_intervals(clip_intervals(
+                [iv for _, ft in group for iv in (ft.get("busy_epoch_ns") or [])], lo, hi))
+            span_ns = max(hi - lo, 1)
+            free_ns = max(span_ns - total_length(busy), 0)
+            idles = [ft["host_idle"] for _, ft in group if ft.get("host_idle") is not None]
+            line = (f"{t_ns} MACHINE machine={machine} devices={len(group)} "
+                    f"free={100.0 * free_ns / span_ns:.2f}% free_s={free_ns / 1e9:.3f} "
+                    f"span_s={span_ns / 1e9:.3f} "
+                    f"merge_slop_s={sum(ft.get('merge_slop_ns', 0) for _, ft in group) / 1e9:.3f}")
+            if idles:
+                line += f" host_idle={sum(idles) / len(idles):.2f}%"
+            lines.append(line)
+
+        free, span, ratio, mean = pooled(devices)
+        lines.append(f"{t_ns} SYSTEM devices={len(devices)} clusters={len(by_cluster)} "
+                     f"machines={len(by_machine)} free={ratio:.2f}% free_mean={mean:.2f}% "
+                     f"free_s={free / 1e9:.3f} span_s={span / 1e9:.3f}")
+        with open(self.free_time_group_path, "w") as f:
+            f.write("\n".join(lines) + "\n")
+        src.Log.print_with_color(f"[FreeTime] {lines[-1]}", "green")
+
+    def _write_free_time_series(self, t_ns, devices):
+        """One line per device per bucket. The leading timestamp is the report's
+        server-clock arrival; the position in the run is carried by t_offset_s,
+        which is on the DEVICE's clock. Devices start at different moments, so
+        their offsets are not directly comparable — do not conflate the two."""
+        lines = []
+        for report, ft in devices:
+            client, role, machine, cluster, _ = self._ft_ident(report, ft)
+            for i, offset_s, bucket_s, free_pct in ft.get("series") or []:
+                # bucket_s travels on EVERY line rather than being assumed, so a
+                # long run may widen its buckets without breaking readers.
+                lines.append(f"{t_ns} client={client} role={role} machine={machine} "
+                             f"cluster={cluster} i={i} t_offset_s={offset_s:.3f} "
+                             f"bucket_s={bucket_s:.3f} free={free_pct:.2f}%")
+        with open(self.free_time_series_path, "w") as f:
+            f.write(("\n".join(lines) + "\n") if lines else "")
+
+    # ─────────────────── Message size (guide/12-message-size.md) ─────────────
+
+    def _write_message_size(self, reports):
+        """message_size.log + message_size_series.log (01 §3.11-3.12).
+
+        Normally exactly one line in the summary: the payload shape is fixed by
+        the configuration, so it is the same on every worker in a group and one
+        worker measuring is one worker too few only if it fails."""
+        if not self._msg_size_enabled:
+            return
+        measured = [r["message_size"] for r in reports if r.get("message_size")]
+        if not measured:
+            src.Log.print_with_color(
+                "[MsgSize] enabled but the selected worker reported nothing", "yellow")
+            return
+        t_ns = time.time_ns()
+        try:
+            summary, series = [], []
+            for report in measured:
+                n, span_s = report["n"], report["span_s"]
+                total_mb = report["total_bytes"] / 1e6
+                mean_mb = report["mean_bytes"] / 1e6
+                safe = {k: self._kv_safe(report.get(k)) for k in
+                        ("client", "role", "machine", "cluster", "mode", "splits",
+                         "compress", "num_bit", "batch_size")}
+                try:
+                    batch_size = float(report.get("batch_size") or 0)
+                except (TypeError, ValueError):
+                    batch_size = 0.0
+                summary.append(
+                    f"{t_ns} client={safe['client']} role={safe['role']} "
+                    f"machine={safe['machine']} cluster={safe['cluster']} "
+                    # The context that DETERMINES the size. A size without it
+                    # cannot be reproduced.
+                    f"mode={safe['mode']} splits={safe['splits']} "
+                    f"compress={safe['compress']} num_bit={safe['num_bit']} "
+                    f"batch_size={safe['batch_size']} n={n} "
+                    f"total_mb={total_mb:.3f} mean_mb={mean_mb:.3f} "
+                    f"p50_mb={report['p50_bytes'] / 1e6:.3f} "
+                    f"p95_mb={report['p95_bytes'] / 1e6:.3f} "
+                    f"max_mb={report['max_bytes'] / 1e6:.3f} "
+                    f"min_mb={report['min_bytes'] / 1e6:.3f} "
+                    f"span_s={span_s:.3f} "
+                    f"rate_mb_s={(total_mb / span_s if span_s else 0.0):.3f} "
+                    f"per_frame_mb={(mean_mb / batch_size if batch_size else 0.0):.4f}")
+                # Offsets, never device timestamps: every timestamp in a shared
+                # file is the server's own clock (invariant 1), and an offset
+                # locates a sample without ever crossing machines.
+                for i, (offset_s, batch_id, n_bytes) in enumerate(report.get("series") or []):
+                    series.append(f"{t_ns} client={safe['client']} "
+                                  f"cluster={safe['cluster']} i={i} "
+                                  f"t_offset_s={offset_s:.3f} batch_id={batch_id} "
+                                  f"bytes={n_bytes} mb={n_bytes / 1e6:.3f}")
+            with open(self.msg_size_path, "w") as f:
+                f.write("\n".join(summary) + "\n")
+            with open(self.msg_size_series_path, "w") as f:
+                f.write(("\n".join(series) + "\n") if series else "")
+            for line in summary:
+                src.Log.print_with_color(f"[MsgSize] {line}", "cyan")
+        except Exception as e:
+            src.Log.print_with_color(f"[MsgSize] writing failed: {e}", "yellow")
+
     # ─────────────────── Archiving (guide/05-archiving.md) ───────────────────
 
     def _archive_results(self):
@@ -573,6 +859,11 @@ class Server:
         while not self._fps_shutdown:
             self.connection.process_data_events(time_limit=1.0)
         self._collect_utilization()   # after FPS summary, before close (03 §5)
+        # The last collector finishing is not the system being idle: the drain is
+        # still settling, and a curve stopped there ends on the busiest moment of
+        # the shutdown. Sample a short tail past it (11 §6).
+        self._broker_ram.stop()
+        self._broker_ram.write_summary()
         self._archive_results()       # after the last shutdown pipeline has written (05 §3)
         try:
             self.connection.close()
@@ -619,9 +910,21 @@ class Server:
                             "model_name": self.model_name,
                             "num_layers_model" : num_layers_model,
                             "data": self.data,
-                            "compress": self.compress}
+                            "compress": self.compress,
+                            # Measurement flags travel WITH the work, so a
+                            # worker never reads one locally (invariant 9).
+                            "free_time": self._free_time_dispatch,
+                            "message_size": self._msg_size_dispatch,
+                            "measure_message_size": bool(
+                                self._msg_size_enabled
+                                and client_id == self._msg_size_client)}
 
                 self.send_to_response(client_id, pickle.dumps(response))
+
+            if self._msg_size_enabled:
+                src.Log.print_with_color(
+                    f"[MsgSize] client {self._msg_size_client} selected to measure "
+                    f"payload size (first registered at tier 1)", "green")
 
             # The split decision, overlaid on the timeline as a vertical rule.
             # No `key=value` in the description: the universal parser would pick
@@ -630,6 +933,10 @@ class Server:
                             f"cut {optimal_cut} "
                             f"({'pdd' if self.pdd else 'static'})")
             self._fps_start_t = time.time()   # shared START: the clock starts when work is dispatched
+            # Marks PARTITION the RAM series, they never gate it: sampling does
+            # not pause here, so a missing mark coarsens the split rather than
+            # leaving a gap (11 §6).
+            self._broker_ram.mark("run")
         else:
             response = {"action": "STOP",
                         "message": "Stop inference !!!"}
@@ -637,16 +944,52 @@ class Server:
                 if layers is None or layer_id in layers:
                     self.send_to_response(client_id, pickle.dumps(response))
 
+    DEFAULT_CUTS = {"a": 4, "b": 11, "c": 17, "d": 23}
+
+    def _num_layers_model(self):
+        """Layer count of the model, read from the layer profile."""
+        with open(self.layer_profile_path, "r", encoding="utf-8") as f:
+            return len(json.load(f)[0]["cut_data_sizes_mb"]) + 1
+
+    def _static_plan(self):
+        """The fixed-cut plan, shaped EXACTLY like the PDD plan.
+
+        Every caller unpacks `(cut, clouds_split, num_layers_model)`, so every
+        return path has to produce that shape — returning a bare int or a dict
+        on the fallback paths raised a TypeError at dispatch and took the whole
+        run with it.
+
+        Policy: cut at the configured layer, then chain every registered cloud
+        in registration order with the remaining layers split evenly between
+        them. Registration order is the same selector used for the message-size
+        worker (12 §1) — it needs no configuration and is stable within a run.
+        Splitting evenly rather than parking everything on one cloud keeps every
+        registered device doing work; a cloud with no segment would sit in its
+        consume loop until STOP and report a run of pure free time."""
+        static_cut = self.DEFAULT_CUTS[self.cut_layer]
+        try:
+            num_layers_model = self._num_layers_model()
+        except Exception as e:
+            src.Log.print_with_color(
+                f"[Split] cannot read {self.layer_profile_path}: {e}", "red")
+            num_layers_model = static_cut + 1
+        clouds = [client_id for client_id, layer_id in self.list_clients if layer_id > 1]
+        if not clouds:
+            return static_cut, {"first_cloud": None}, num_layers_model
+
+        n = len(clouds)
+        remaining = max(num_layers_model - static_cut, n)
+        edges = [static_cut + round(i * remaining / n) for i in range(n)] + [num_layers_model]
+        clouds_split = {"first_cloud": clouds[0]}
+        for i, client_id in enumerate(clouds):
+            clouds_split[client_id] = (edges[i], edges[i + 1],
+                                       clouds[i + 1] if i + 1 < n else None)
+        return static_cut, clouds_split, num_layers_model
+
     def _compute_splits_from_profiles(self):
-        default_splits = {
-            "a": 4,
-            "b": 11,
-            "c": 17,
-            "d": 23
-        }
-        static_cut = default_splits[self.cut_layer]
+        static_cut = self.DEFAULT_CUTS[self.cut_layer]
         if not self.pdd:
-            return static_cut
+            return self._static_plan()
         try:
             with open(self.devices_path, "r", encoding="utf-8") as f:
                 devices_profile = json.load(f)
@@ -654,7 +997,7 @@ class Server:
                 layer_profile = json.load(f)
         except Exception as e:
             src.Log.print_with_color(f"[PDD] Đọc profiles thất bại: {e}", "red")
-            return static_cut
+            return self._static_plan()
 
         # Cloud layer times
         cloud_compute = [cloud["compute_capacity_gflops"] for cloud in devices_profile["clouds"]]
@@ -665,7 +1008,7 @@ class Server:
             src.Log.print_with_color(
                 "[PDD] Không có edge client trong profiles – dùng static cut", "red"
             )
-            return static_cut
+            return self._static_plan()
 
         client_compute = [edge["compute_capacity_gflops"] for edge in edge_clients]
         all_cu_flops = np.array(
@@ -703,4 +1046,4 @@ class Server:
             return optimal_cut, clouds_split , num_layers_model
         except Exception as e:
             src.Log.print_with_color(f"[PDD] Lỗi tính toán: {e}", "red")
-            return {"default": static_cut}
+            return self._static_plan()
