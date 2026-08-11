@@ -11,6 +11,8 @@ way that measurement is usually wrong:
   broker RAM   phases partition the series; a phase with no samples is omitted,
                never written as zeros; every line names its source
   message size min <= p50 <= p95 <= max, and exactly one worker measured
+  broker guard the per-queue caps must SUM to the budget, resume < high < cap, and
+               a limit nobody observed is reported as `unknown`, never as held
 
     python scratch/validate_optional.py <run-dir>
 """
@@ -241,6 +243,104 @@ def check_message_size(d, errs, warns, notes):
                  f"(decimated from {k.get('n')})")
 
 
+def check_broker_guard(d, errs, warns, notes):
+    """guide/13 §6. The family whose invariants are about AGREEMENT: a limit
+    that reports itself as held is worth nothing unless the file also shows what
+    it was measured against, and unless the summary and the series tell the same
+    story."""
+    series, summary = (read(d / "broker_guard_ns.log"),
+                       read(d / "broker_guard.log"))
+    if series is None and summary is None:
+        notes.append("broker guard: not emitted (optional, all-or-none) — skipped")
+        return
+    if series is None or summary is None:
+        errs.append("broker guard: files 15-16 are one feature — emit both or neither")
+        return
+    if not summary:
+        notes.append("broker guard: files present but empty (feature off this run)")
+        return
+
+    kinds = [flags(l)[0] for l in summary if flags(l)]
+    guard = next((kv(l) for l in summary if "GUARD" in flags(l)), {})
+    if not guard:
+        errs.append("broker_guard.log: no GUARD line — the budget it enforced is "
+                    "the one thing every other line is relative to")
+        return
+
+    per_q, n_q = num(guard.get("per_queue_mb")), num(guard.get("queues"))
+    if abs(per_q * n_q - num(guard.get("payload_budget_mb"))) > 0.5:
+        errs.append(f"broker_guard.log: {n_q:.0f} x per_queue_mb {per_q:.1f} != "
+                    f"payload_budget_mb {num(guard.get('payload_budget_mb')):.1f} "
+                    f"— the per-queue caps must SUM to the budget, or the cap the "
+                    f"run enforced is not the cap it reports")
+    if not (num(guard.get("resume_mb")) < num(guard.get("high_mb")) < per_q):
+        errs.append("broker_guard.log: resume_mb < high_mb < per_queue_mb required "
+                    "— without the gap a producer oscillates on the threshold")
+    if num(guard.get("payload_budget_mb")) >= num(guard.get("cap_mb")):
+        errs.append("broker_guard.log: payload_budget_mb must be BELOW cap_mb — "
+                    "the broker's own overhead and the control plane are not free")
+
+    broker = next((kv(l) for l in summary if "BROKER" in flags(l)), {})
+    if not broker:
+        errs.append("broker_guard.log: no BROKER line")
+    else:
+        within = broker.get("within_cap")
+        if within not in ("yes", "NO", "unknown"):
+            errs.append(f"broker_guard.log: within_cap={within!r}, expected "
+                        f"yes/NO/unknown")
+        if int(num(broker.get("polls", 0))) == 0 and within != "unknown":
+            # The failure this catches: an unreachable management API reporting
+            # a peak of 0 MB, which reads as a run that never came close.
+            errs.append("broker_guard.log: polls=0 but within_cap is not unknown "
+                        "— a limit nobody observed cannot be reported as held")
+        if int(num(broker.get("alarms", 0))) > 0 and \
+                not any("ALARM" in flags(l) for l in series):
+            errs.append("broker_guard.log: alarms>0 but broker_guard_ns.log has no "
+                        "ALARM line — the summary and the series disagree")
+
+    policy_on = guard.get("policy") == "on"
+    for i, line in enumerate(summary, 1):
+        if "QUEUE" not in flags(line):
+            continue
+        k = kv(line)
+        if policy_on and num(k.get("peak_mb")) > num(k.get("cap_mb")) + 0.5:
+            errs.append(f"broker_guard.log:{i}: {k.get('queue')} peaked at "
+                        f"{k.get('peak_mb')} MB above its cap {k.get('cap_mb')} MB "
+                        f"while policy=on — the broker-side cap did not hold")
+
+    throttles = [kv(l) for l in summary if "THROTTLE" in flags(l)]
+    per_client = [t for t in throttles if t.get("client") != "ALL"]
+    if per_client and not any(t.get("client") == "ALL" for t in throttles):
+        errs.append("broker_guard.log: per-producer THROTTLE lines without the "
+                    "client=ALL roll-up")
+    for t in per_client:
+        if int(num(t.get("nacks", 0))) > 0 and not policy_on:
+            errs.append(f"broker_guard.log: client={t.get('client')} reports "
+                        f"nacks>0 with policy=off — a rejection can only come "
+                        f"from the policy")
+        if int(num(t.get("events", 0))) == 0 and num(t.get("wait_s", 0)) > 0:
+            errs.append(f"broker_guard.log: client={t.get('client')} waited "
+                        f"{t.get('wait_s')}s across zero events")
+
+    known = {"GUARD", "BROKER", "POLICY", "WATERMARK", "ALARM", "OVER", "UNDER",
+             "BLOCKED", "NOTE"}
+    unknown = {f[0] for f in (flags(l) for l in series) if f and f[0] not in known}
+    if unknown:
+        errs.append(f"broker_guard_ns.log: unknown line kind(s) {sorted(unknown)}")
+    n_alarm = sum(1 for l in series if "ALARM" in flags(l))
+    if n_alarm % 2:
+        # One edge without the other leaves the duration unrecoverable.
+        warns.append("broker_guard_ns.log: an odd number of ALARM lines — an alarm "
+                     "that went on and never off means the run ended inside it")
+
+    notes.append(f"broker guard: cap {guard.get('cap_mb')} MB, "
+                 f"{n_q:.0f} queue(s) x {per_q:.1f} MB, policy={guard.get('policy')}, "
+                 f"watermark={guard.get('watermark')}, "
+                 f"peak {broker.get('mem_peak_mb')} MB, "
+                 f"within_cap={broker.get('within_cap')}, "
+                 f"{len(per_client)} throttled producer(s)")
+
+
 def check_no_spaces_in_values(d, errs, warns, notes):
     """A `key=value` value MUST contain no spaces (guide/01 §1).
 
@@ -283,6 +383,7 @@ def main(run_dir):
     check_free_time(d, errs, warns, notes)
     check_broker_ram(d, errs, warns, notes)
     check_message_size(d, errs, warns, notes)
+    check_broker_guard(d, errs, warns, notes)
 
     print(f"\noptional-family checks for {d}")
     for n in notes:

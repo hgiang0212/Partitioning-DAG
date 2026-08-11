@@ -10,6 +10,7 @@ import os
 import psutil
 import numpy as np
 
+from src.BrokerGuard import PublishGuard
 from src.Compress import Encoder, Decoder
 import src.Log as Log
 from src.Measure import FreeTimeTracker, MessageSizeRecorder
@@ -64,6 +65,11 @@ class Scheduler:
         # (guide/README invariant 9). Until then they are inert.
         self.free_time = FreeTimeTracker(enabled=False)
         self.msg_size = MessageSizeRecorder(enabled=False)
+        # Admission control (guide/13). Inert until the dispatch message arrives,
+        # for the same reason: the byte budget is the server's to divide, and a
+        # worker that capped itself from its own config file would be one stale
+        # copy away from a run where twelve producers enforced two limits.
+        self.publish_guard = PublishGuard(enabled=False)
         self.size_message = None
         self.splits = None
         self.map_metric = None
@@ -97,6 +103,23 @@ class Scheduler:
         if self.msg_size.enabled:
             Log.print_with_color(
                 f"[MsgSize] this worker is the one measuring payload size", "green")
+        # The share of the broker's memory this producer may occupy (13 §3).
+        # Bound to the connection here, not at first publish: opening a channel
+        # inside the hot path would put a connection error on the batch that
+        # happens to be first through it.
+        guard_cfg = response.get("broker_guard") or {}
+        self.publish_guard = PublishGuard(
+            enabled=bool(guard_cfg.get("enabled", False)),
+            high_bytes=float(guard_cfg.get("high_bytes", 0)),
+            resume_bytes=float(guard_cfg.get("resume_bytes", 0)),
+            cap_bytes=float(guard_cfg.get("cap_bytes", 0)),
+            probe_frac=float(guard_cfg.get("probe_frac", 0.5)),
+            probe_interval_s=float(guard_cfg.get("probe_interval_s", 2.0)),
+            max_block_s=float(guard_cfg.get("max_block_s", 300.0)),
+            poll_s=float(guard_cfg.get("poll_s", 0.05)),
+            confirm=bool(guard_cfg.get("confirm", False)))
+        self.publish_guard.bind(self.channel)
+
         # Context that DETERMINES the size — a size without it is unreproducible.
         self._ms_context = {
             "mode": ms_cfg.get("mode", "split"),
@@ -190,8 +213,16 @@ class Scheduler:
                    "pipeline_ms": self._pipeline_ms, "e2e_ms": self._e2e_ms,
                    "free_time": free_time,       # reports NOTHING, never zeros
                    "message_size": self._message_size_report(),
+                   # Whether the cap actually bit, and for how long. Without it a
+                   # throttled run and an unthrottled one differ only by a
+                   # throughput number neither of them explains.
+                   "broker_guard": self.publish_guard.report({
+                       "client": self._kv_safe(self.client_id),
+                       "role": "edge" if self.layer_id == 1 else "cloud",
+                       "cluster": self._kv_safe(self.cluster)}),
                    **stats}
-        if not stats and free_time is None and message["message_size"] is None:
+        if not stats and free_time is None and message["message_size"] is None \
+                and message["broker_guard"] is None:
             return                               # nothing worth a publish
         body = pickle.dumps(message)
         try:
@@ -558,13 +589,24 @@ class Scheduler:
         # Log message size
         Log.print_with_color(f"[>>>] Sending message to {intermediate_queue}: {self.size_message} bytes", "yellow")
 
+        # Admission control sits HERE and nowhere else: this is the only publish
+        # in the system whose volume is set by how fast video decodes rather
+        # than by how fast anything downstream consumes, and it is therefore the
+        # only one that can grow the broker without bound (13 §1).
         t_send = self.free_time.now()
-        self.channel.basic_publish(
-            exchange='',
-            routing_key=intermediate_queue,
-            body=message,
-        )
-        self.free_time.add_work("send", t_send)
+        waited_s = self.publish_guard.publish(self.channel, intermediate_queue, message)
+        t_done = self.free_time.now()
+        if waited_s > 0:
+            # Booked as a WAIT, not as work. A producer paused by backpressure
+            # was idle; charging that to "send" would report a throttled device
+            # as fully utilized, which is the exact opposite of what happened
+            # and would hide the cost of the cap in the one file built to show
+            # it (guide/10 §2).
+            t_split = min(t_send + int(waited_s * 1e9), t_done)
+            self.free_time.add_wait("broker_backpressure", t_send, t_split)
+            self.free_time.add_work("send", t_split, t_done)
+        else:
+            self.free_time.add_work("send", t_send, t_done)
 
     def send_to_server(self, message):
         self.channel.queue_declare('rpc_queue', durable=False)

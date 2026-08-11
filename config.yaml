@@ -54,6 +54,41 @@ message_size:             # guide/12 — bytes one worker puts on the wire
                           # statistics still use every sample
   mode: split             # context recorded beside the size, so it is reproducible
 
+broker_guard:             # guide/13 — the LIMIT on the broker's RAM (11 only measures it)
+  enabled: True
+  max_broker_ram_mb: 1024 # the whole point: RabbitMQ stays under 1 GB
+  broker_overhead_mb: 200 # Erlang VM + management DB + one connection per worker;
+                          # a budget that hands the full cap to payload is over it
+                          # before the first batch
+  control_reserve_mb: 150 # the model itself ships through reply_* (base64 weights,
+                          # ~7.4 MB × every worker). Transient, on no work queue,
+                          # policed by nothing — so it is reserved, not capped.
+  work_queues:            # what the payload budget is divided across, evenly:
+    - queue_0             # the division has to hold when a split moves and a queue
+    - queue_1             # that carried nothing last run carries everything now
+    - queue_2
+  high_frac: 0.75         # a producer pauses above this fraction of its queue's cap
+  resume_frac: 0.50       # ...and resumes below this one. The gap is what stops a
+                          # producer from oscillating on the threshold.
+  apply_policy: True      # broker-side hard cap: max-length-bytes + reject-publish.
+                          # NOT drop-head — that deletes the oldest batch silently,
+                          # and a run that quietly loses units still prints a
+                          # throughput number. Needs a policymaker/administrator user.
+  keep_policy: False      # remove it at shutdown; the broker is shared
+  confirm_publish: True   # REQUIRED for reject-publish to be loss-free: without
+                          # confirms a rejected publish is discarded and the producer
+                          # is never told. Costs one round trip per payload publish.
+  poll_interval_s: 2.0    # server-side watch for the memory alarm and blocked
+                          # connections — the two things invisible from a worker
+  max_block_s: 300        # a producer paused this long stops waiting and says so;
+                          # ending a run is the server's stall detector's call
+  enforce_watermark: False  # `rabbitmqctl set_vm_memory_high_watermark absolute`
+                          # over the ssh login below — the only limit that is
+                          # literally the broker's own. Opt-in: it is a global change
+                          # to a host shared with whatever else uses this broker.
+                          # Off, the exact command is printed instead.
+  restore_watermark: True # put it back at shutdown (it also reverts on restart)
+
 broker_ram:               # guide/11 — RAM of the queue host, which runs no code of ours
   enabled: False          # needs HOST login credentials below; falls back to the
                           # management API (broker process, not host) and labels it

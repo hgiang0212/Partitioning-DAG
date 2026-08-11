@@ -16,6 +16,7 @@ from requests.auth import HTTPBasicAuth
 from ultralytics import YOLO
 
 import src.Log
+from src.BrokerGuard import BrokerGuard
 from src.BrokerRam import BrokerRamSampler
 from src.Measure import clip_intervals, merge_intervals, total_length
 from src.PDD import evaluate_pdd_for_one_client
@@ -83,6 +84,8 @@ class Server:
         self.broker_ram_path       = f"{log_path}/broker_ram.log"
         self.msg_size_path         = f"{log_path}/message_size.log"       # 12
         self.msg_size_series_path  = f"{log_path}/message_size_series.log"
+        self.broker_guard_ns_path  = f"{log_path}/broker_guard_ns.log"    # 13
+        self.broker_guard_path     = f"{log_path}/broker_guard.log"
         self.result_files = [self.batch_log_path, self.group_rate_ns_path,
                              self.group_rate_path, self.util_log_path,
                              self.util_group_path, self.latency_group_path,
@@ -90,7 +93,8 @@ class Server:
                              self.free_time_path, self.free_time_group_path,
                              self.free_time_series_path,
                              self.broker_ram_ns_path, self.broker_ram_path,
-                             self.msg_size_path, self.msg_size_series_path]
+                             self.msg_size_path, self.msg_size_series_path,
+                             self.broker_guard_ns_path, self.broker_guard_path]
         # Truncate ALL of them UNCONDITIONALLY, once, centrally, before any
         # worker can write (01 §4) — including the optional ones, and including
         # the ones this run's flags turn off. Conditional truncation is how a
@@ -154,6 +158,21 @@ class Server:
             config.get("broker_ram"), self.address, self.username, self.password,
             self.virtual_host, self.broker_ram_ns_path, self.broker_ram_path)
         self._broker_ram.start()
+
+        # ── Bounding that host's memory (guide/13-broker-guard.md) ─────────
+        # Applied HERE, before a single worker can register: the limits have to
+        # be in force before anything is published, and a queue policy applied
+        # halfway through a run leaves the first half unbounded and the two
+        # halves incomparable. The ssh block from broker_ram is reused — the
+        # watermark lives on the same host, behind the same login — so the
+        # credentials are configured once.
+        guard_cfg = config.get("broker_guard") or {}
+        self._broker_guard = BrokerGuard(
+            guard_cfg, self.address, self.username, self.password,
+            self.virtual_host, self.broker_guard_ns_path, self.broker_guard_path,
+            ssh_config=(config.get("broker_ram") or {}).get("ssh"))
+        self._broker_guard.apply()
+        self._guard_reports = []
 
         # ── Archiving (guide/05-archiving.md) ──────────────────────────────
         archive_cfg = config.get("archive") or {}
@@ -461,6 +480,10 @@ class Server:
         # poll and no extra timeout to burn (guide/README invariant 10).
         self._write_free_time(reports)
         self._write_message_size(reports)
+        # Held, not written: the guard's own peaks are only final once its
+        # monitor has stopped, and that happens after this drain (13 §4).
+        self._guard_reports = [r["broker_guard"] for r in reports
+                               if r.get("broker_guard")]
 
     @staticmethod
     def _cluster_of(report):
@@ -864,6 +887,11 @@ class Server:
         # the shutdown. Sample a short tail past it (11 §6).
         self._broker_ram.stop()
         self._broker_ram.write_summary()
+        # Stop before summarising: the monitor is what observed the peaks, and
+        # stopping it is also what hands the broker back — the policy comes off
+        # here whether the run ended cleanly or on the stall detector.
+        self._broker_guard.stop()
+        self._broker_guard.write_summary(self._guard_reports)
         self._archive_results()       # after the last shutdown pipeline has written (05 §3)
         try:
             self.connection.close()
@@ -915,6 +943,10 @@ class Server:
                             # worker never reads one locally (invariant 9).
                             "free_time": self._free_time_dispatch,
                             "message_size": self._msg_size_dispatch,
+                            # The publisher's share of the memory budget travels
+                            # with the work too — a cap that lived in each
+                            # worker's config file would be twelve caps.
+                            "broker_guard": self._broker_guard.dispatch(),
                             "measure_message_size": bool(
                                 self._msg_size_enabled
                                 and client_id == self._msg_size_client)}
