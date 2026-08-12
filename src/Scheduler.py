@@ -72,10 +72,20 @@ class Scheduler:
         self.publish_guard = PublishGuard(enabled=False)
         self.size_message = None
         self.splits = None
+        # Accuracy (map.log / map_window.log). Inert until the dispatch message
+        # arrives — the ground-truth path is the server's to choose, exactly
+        # like every measurement flag above.
         self.map_metric = None
         self.gt_dict = {}
         self._det_results = {}
-        self._load_gt_dict()
+        self._map_enabled = False
+        self._map_window_batches = 16
+        self._map_frames = 0          # frames actually scored against ground truth
+        self._map_window_metric = None
+        self._map_window_frames = 0
+        self._map_window_batch0 = None
+        self._map_series = []         # (i, t_offset_s, batches, frames, m50, m5095)
+        self._map_t0_ns = None
 
     # ──────────────────────────── Measurement helpers ────────────────────────
 
@@ -120,6 +130,18 @@ class Scheduler:
             confirm=bool(guard_cfg.get("confirm", False)))
         self.publish_guard.bind(self.channel)
 
+        # Accuracy. The ground-truth directory arrives in the dispatch message
+        # too: a worker reading it from its own config file is one stale copy
+        # away from two machines scoring against two different ground truths
+        # and the server averaging the result into one meaningless number
+        # (guide/README invariant 9). Loading is deferred to here for the same
+        # reason — at __init__ the dispatch has not arrived yet.
+        map_cfg = response.get("map") or {}
+        self._map_enabled = bool(map_cfg.get("enabled", False))
+        self._map_window_batches = max(int(map_cfg.get("window_batches", 16)), 1)
+        if self._map_enabled:
+            self._load_gt_dict(map_cfg.get("gt_dir", "datasets/groundtruth"))
+
         # Context that DETERMINES the size — a size without it is unreproducible.
         self._ms_context = {
             "mode": ms_cfg.get("mode", "split"),
@@ -147,7 +169,7 @@ class Scheduler:
 
         The same intervals are also returned as raw `service_ms` samples, so
         `Σ service == busy_s` holds by construction — that identity is the
-        conformance check tying latency_group.log to utilization_group.log."""
+        conformance check tying latency_cluster.log to utilization_cluster.log."""
         try:
             with open(log_path) as f:
                 lines = f.readlines()
@@ -213,6 +235,10 @@ class Scheduler:
                    "pipeline_ms": self._pipeline_ms, "e2e_ms": self._e2e_ms,
                    "free_time": free_time,       # reports NOTHING, never zeros
                    "message_size": self._message_size_report(),
+                   # Accuracy rides the same report and the same drain as every
+                   # other measurement, so turning it on costs the shutdown no
+                   # extra queue and no extra timeout (invariant 10).
+                   "map": self._map_report(),
                    # Whether the cap actually bit, and for how long. Without it a
                    # throttled run and an unthrottled one differ only by a
                    # throughput number neither of them explains.
@@ -222,7 +248,7 @@ class Scheduler:
                        "cluster": self._kv_safe(self.cluster)}),
                    **stats}
         if not stats and free_time is None and message["message_size"] is None \
-                and message["broker_guard"] is None:
+                and message["broker_guard"] is None and message["map"] is None:
             return                               # nothing worth a publish
         body = pickle.dumps(message)
         try:
@@ -325,6 +351,8 @@ class Scheduler:
 
     def _load_gt_dict(self, gt_dir="datasets/groundtruth"):
         if not os.path.isdir(gt_dir):
+            Log.print_with_color(
+                f"[mAP] ground truth '{gt_dir}' not found — accuracy not scored", "yellow")
             return
         try:
             from torchmetrics.detection import MeanAveragePrecision
@@ -372,12 +400,90 @@ class Scheduler:
                 f.write(json.dumps({"frame": frame_num, "dets": dets}) + "\n")
             if self.map_metric is None or frame_num not in self.gt_dict:
                 continue
-            self.map_metric.update(
-                [{"boxes":  r["boxes"].cpu().float(),
-                  "scores": r["scores"].cpu().float(),
-                  "labels": r["classes"].cpu().long()}],
-                [self.gt_dict[frame_num]]
-            )
+            pred = [{"boxes":  r["boxes"].cpu().float(),
+                     "scores": r["scores"].cpu().float(),
+                     "labels": r["classes"].cpu().long()}]
+            target = [self.gt_dict[frame_num]]
+            self.map_metric.update(pred, target)     # whole-run, for map.log
+            self._map_window_update(pred, target)    # this window, for map_window.log
+            self._map_frames += 1
+        self._map_window_close(batch_id)
+
+    # ── windowed accuracy (map_window.log) ───────────────────────────────────
+    # A whole-run mAP says how good the run was; it cannot say whether accuracy
+    # DRIFTED while it ran. Each window is scored by its own metric instance
+    # over only that window's frames, so a late collapse shows up as a falling
+    # series instead of being averaged into the headline number.
+
+    def _map_window_update(self, pred, target):
+        if self._map_window_metric is None:
+            try:
+                from torchmetrics.detection import MeanAveragePrecision
+                self._map_window_metric = MeanAveragePrecision(iou_type="bbox")
+            except Exception:
+                return
+            if self._map_t0_ns is None:
+                self._map_t0_ns = time.time_ns()
+        self._map_window_metric.update(pred, target)
+        self._map_window_frames += 1
+
+    def _map_window_close(self, batch_id):
+        """Close a tumbling window every `window_batches` batches. Windows are
+        counted in BATCHES, not seconds: frames only exist in batch units, so a
+        time bucket would have to split one, and the split half would be scored
+        against nothing."""
+        if self._map_window_batch0 is None:
+            self._map_window_batch0 = batch_id
+        if batch_id - self._map_window_batch0 + 1 < self._map_window_batches:
+            return
+        batches = batch_id - self._map_window_batch0 + 1
+        self._map_window_batch0 = batch_id + 1
+        if self._map_window_metric is None or not self._map_window_frames:
+            return
+        try:
+            result = self._map_window_metric.compute()
+            # Offset from this worker's OWN first scored frame. It never crosses
+            # a machine boundary, so it is exact, and it locates the window in
+            # the run without a device timestamp reaching a shared file.
+            offset_s = (time.time_ns() - self._map_t0_ns) / 1e9
+            self._map_series.append((len(self._map_series), offset_s, batches,
+                                     self._map_window_frames,
+                                     float(result["map_50"]), float(result["map"])))
+        except Exception as e:                       # telemetry never kills the run
+            Log.print_with_color(f"[mAP] window compute failed: {e}", "yellow")
+        self._map_window_metric = None               # fresh metric per window
+        self._map_window_frames = 0
+
+    def _map_report(self):
+        """Whole-run accuracy plus the window series, or None when this worker
+        scored nothing — a completing tier with no ground truth reports NOTHING
+        rather than reporting 0.0, which would read as a model that detected
+        nothing at all."""
+        if not self._map_enabled or self.map_metric is None or not self._map_frames:
+            return None
+        try:
+            self._map_window_flush()
+            result = self.map_metric.compute()
+            return {
+                "client": self._kv_safe(self.client_id),
+                "cluster": self._kv_safe(self.cluster),
+                "frames": len(self._det_results),
+                "matched": self._map_frames,   # frames that had ground truth
+                "map50": float(result["map_50"]),
+                "map5095": float(result["map"]),
+                "series": self._map_series,
+            }
+        except Exception as e:
+            Log.print_with_color(f"[mAP] report failed: {e}", "yellow")
+            return None
+
+    def _map_window_flush(self):
+        """Close a partial trailing window, so the last frames of the run are in
+        the series instead of being silently dropped with it."""
+        if self._map_window_metric is None or not self._map_window_frames:
+            return
+        self._map_window_batches = 1        # force the next close to fire
+        self._map_window_close(self._map_window_batch0 or 0)
 
     def _print_map(self):
         if self.map_metric is None:

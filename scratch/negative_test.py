@@ -30,14 +30,14 @@ def _sub(path, pattern, repl, count=1):
 
 def double_counted_units(d):
     """Two stages publish for the same unit -> group `done` sums past SYSTEM."""
-    _sub(d / "group_rate.log", r"(cluster=queue_2 .*?done=)(\d+)",
+    _sub(d / "fps_cluster.log", r"(cluster=queue_2 .*?done=)(\d+)",
          lambda m: f"{m.group(1)}{int(m.group(2)) + 40}")
 
 
 def stage_stopped_early(d):
     """No final drain after the compute thread joins -> line-count mismatch."""
-    lines = (d / "group_rate_ns.log").read_text(encoding="utf-8").splitlines()
-    (d / "group_rate_ns.log").write_text("\n".join(lines[:-4]) + "\n", encoding="utf-8")
+    lines = (d / "fps_cluster_ns.log").read_text(encoding="utf-8").splitlines()
+    (d / "fps_cluster_ns.log").write_text("\n".join(lines[:-4]) + "\n", encoding="utf-8")
 
 
 def overlapping_busy_intervals(d):
@@ -48,32 +48,32 @@ def overlapping_busy_intervals(d):
 def per_group_start(d):
     """A per-group START where a shared one was required -> SYSTEM span no longer
     equals the max group span."""
-    _sub(d / "group_rate.log", r"(SYSTEM fps=)\d+\.\d+", r"\g<1>31.400")
+    _sub(d / "fps_cluster.log", r"(SYSTEM fps=)\d+\.\d+", r"\g<1>31.400")
 
 
 def averaged_percentiles(d):
     """Percentiles computed on pre-averaged data -> p50 > p95."""
-    _sub(d / "latency_group.log", r"p50_ms=\d+\.\d+", "p50_ms=999999.000")
+    _sub(d / "latency_cluster.log", r"p50_ms=\d+\.\d+", "p50_ms=999999.000")
 
 
 def role_on_e2e(d):
     """`role=` on an e2e line -> double-counts when charts group by role."""
-    _sub(d / "latency_group.log", r"(kind=e2e)", "role=cloud kind=e2e")
+    _sub(d / "latency_cluster.log", r"(kind=e2e)", "role=cloud kind=e2e")
 
 
 def system_carries_steady(d):
     """The SYSTEM line must carry neither steady_fps nor share."""
-    _sub(d / "group_rate.log", r"(SYSTEM fps=\d+\.\d+)", r"\1 steady_fps=9.900")
+    _sub(d / "fps_cluster.log", r"(SYSTEM fps=\d+\.\d+)", r"\1 steady_fps=9.900")
 
 
 def missing_required_file(d):
     """A missing file is a hard error for the reader; an EMPTY one is valid."""
-    (d / "utilization_group.log").unlink()
+    (d / "utilization_cluster.log").unlink()
 
 
 def missing_utilization_mean(d):
     """A pooled figure alone can hide one idle device inside a busy group."""
-    _sub(d / "utilization_group.log", r" utilization_mean=\d+\.\d+%", "", count=99)
+    _sub(d / "utilization_cluster.log", r" utilization_mean=\d+\.\d+%", "", count=99)
 
 
 def non_monotonic_arrivals(d):
@@ -93,16 +93,16 @@ def busy_plus_free_not_span(d):
 def lanes_summed_not_merged(d):
     """The error the whole free-time method exists to prevent: per-kind sums
     equal to merged busy means the lanes were added instead of unioned."""
-    text = (d / "free_time_group.log").read_text(encoding="utf-8")
+    text = (d / "free_time_cluster.log").read_text(encoding="utf-8")
     kept = [l for l in text.splitlines() if " KIND " not in l]
     kept.append("1785000762468320838 cluster=queue_2 KIND kind=inference "
                 "busy_s=0.100 share=0.01%")
-    (d / "free_time_group.log").write_text("\n".join(kept) + "\n", encoding="utf-8")
+    (d / "free_time_cluster.log").write_text("\n".join(kept) + "\n", encoding="utf-8")
 
 
 def reasons_do_not_sum(d):
     """Attribution double-counts, or `unaccounted` was dropped."""
-    _sub(d / "free_time_group.log", r"(FREE reason=input .*?share=)\d+\.\d+%",
+    _sub(d / "free_time_cluster.log", r"(FREE reason=input .*?share=)\d+\.\d+%",
          r"\g<1>40.00%")
 
 
@@ -131,6 +131,20 @@ def phase_written_as_zeros(d):
     (d / "broker_ram.log").write_text(text, encoding="utf-8")
 
 
+def map5095_above_map50(d):
+    """mAP@50:95 averages over thresholds that include .50, so it can never be
+    the larger of the two. When it is, the two columns are swapped — and the run
+    reads as unusually accurate rather than as mislabelled."""
+    _sub(d / "map.log", r"map5095=\d+\.\d+", "map5095=0.9900", count=99)
+
+
+def unlabelled_system_pooling(d):
+    """The SYSTEM mAP is a frame-weighted mean, not a pooled one. Strip the label
+    and it reads as exact — the one failure here that produces a number nobody
+    can tell is wrong."""
+    _sub(d / "map.log", r" pooling=\w+", "")
+
+
 REQUIRED_CASES = [
     ("two stages publish per unit",        double_counted_units,   "sums to"),
     ("stage stopped reporting early",      stage_stopped_early,    "line-count mismatch"),
@@ -152,6 +166,8 @@ OPTIONAL_CASES = [
     ("a value containing a space",          space_inside_a_value,    "stray token"),
     ("RAM source not labelled",            unlabelled_ram_source,   "source="),
     ("empty phase written as zeros",       phase_written_as_zeros,  "OMITTED"),
+    ("mAP@50:95 above mAP@50",             map5095_above_map50,     "cannot be higher"),
+    ("SYSTEM mAP pooling not labelled",    unlabelled_system_pooling, "pooling=frame_weighted"),
 ]
 
 
@@ -186,7 +202,7 @@ def main():
 
     suites = [
         ("guide/validate_results.py", ROOT / "guide" / "validate_results.py",
-         ["--names", "group"], REQUIRED_CASES),
+         ["--names", "cluster"], REQUIRED_CASES),
         ("scratch/validate_optional.py", ROOT / "scratch" / "validate_optional.py",
          [], OPTIONAL_CASES),
     ]

@@ -64,21 +64,25 @@ class Server:
         src.Log.print_with_color(f"Application start. Server is waiting for {self.total_clients} clients.", "green")
 
         # ── Result files (guide/01-result-format.md §2) ────────────────────
-        # Naming scheme for THIS project: `group_*` filenames carrying `cluster=`
-        # keys. One scheme per project — never mix in the `fps_cluster_*` set.
-        # A group here is the cloud chain an edge feeds, named after the queue it
-        # publishes into (`queue_2`); the completing tier tags every DONE with it.
+        # Naming scheme for THIS project: the `*_cluster` set (01 §2 naming
+        # note) — `fps_cluster*`, `utilization_cluster`, `latency_cluster`,
+        # `free_time_cluster` — carrying `cluster=` keys. Both sets are
+        # conformant; the rule is one scheme per project, never mixed, so the
+        # `group_*` names must not appear anywhere in this repo.
+        # A cluster here is the cloud chain an edge feeds, named after the queue
+        # it publishes into (`queue_2`); the completing tier tags every DONE
+        # with it.
         self.log_path = log_path
-        self.batch_log_path     = f"{log_path}/batch_done_ns.log"
-        self.group_rate_ns_path = f"{log_path}/group_rate_ns.log"
-        self.group_rate_path    = f"{log_path}/group_rate.log"
-        self.util_log_path      = f"{log_path}/utilization.log"
-        self.util_group_path    = f"{log_path}/utilization_group.log"
-        self.latency_group_path = f"{log_path}/latency_group.log"
+        self.batch_log_path      = f"{log_path}/batch_done_ns.log"
+        self.fps_cluster_ns_path = f"{log_path}/fps_cluster_ns.log"
+        self.fps_cluster_path    = f"{log_path}/fps_cluster.log"
+        self.util_log_path       = f"{log_path}/utilization.log"
+        self.util_cluster_path    = f"{log_path}/utilization_cluster.log"
+        self.latency_cluster_path = f"{log_path}/latency_cluster.log"
         self.events_path        = f"{log_path}/events_ns.log"
         # Optional families, each all-its-files-or-none (01 §2):
         self.free_time_path        = f"{log_path}/free_time.log"          # 10
-        self.free_time_group_path  = f"{log_path}/free_time_group.log"
+        self.free_time_cluster_path  = f"{log_path}/free_time_cluster.log"
         self.free_time_series_path = f"{log_path}/free_time_series.log"
         self.broker_ram_ns_path    = f"{log_path}/broker_ram_ns.log"      # 11
         self.broker_ram_path       = f"{log_path}/broker_ram.log"
@@ -86,15 +90,23 @@ class Server:
         self.msg_size_series_path  = f"{log_path}/message_size_series.log"
         self.broker_guard_ns_path  = f"{log_path}/broker_guard_ns.log"    # 13
         self.broker_guard_path     = f"{log_path}/broker_guard.log"
-        self.result_files = [self.batch_log_path, self.group_rate_ns_path,
-                             self.group_rate_path, self.util_log_path,
-                             self.util_group_path, self.latency_group_path,
+        # Detection accuracy. NOT a guide family — guide/README puts mAP
+        # explicitly out of scope, because nothing else here depends on ground
+        # truth or on the work being a detection task. It is emitted anyway,
+        # to the same universal grammar (01 §1), so the one parser that reads
+        # every other file reads these two as well.
+        self.map_path              = f"{log_path}/map.log"
+        self.map_window_path       = f"{log_path}/map_window.log"
+        self.result_files = [self.batch_log_path, self.fps_cluster_ns_path,
+                             self.fps_cluster_path, self.util_log_path,
+                             self.util_cluster_path, self.latency_cluster_path,
                              self.events_path,
-                             self.free_time_path, self.free_time_group_path,
+                             self.free_time_path, self.free_time_cluster_path,
                              self.free_time_series_path,
                              self.broker_ram_ns_path, self.broker_ram_path,
                              self.msg_size_path, self.msg_size_series_path,
-                             self.broker_guard_ns_path, self.broker_guard_path]
+                             self.broker_guard_ns_path, self.broker_guard_path,
+                             self.map_path, self.map_window_path]
         # Truncate ALL of them UNCONDITIONALLY, once, centrally, before any
         # worker can write (01 §4) — including the optional ones, and including
         # the ones this run's flags turn off. Conditional truncation is how a
@@ -149,6 +161,19 @@ class Server:
         # Chosen by registration order, which the server already knows before it
         # dispatches anything and which needs no configuration (12 §1).
         self._msg_size_client = None
+
+        # Accuracy. Same flag discipline as every measurement above even though
+        # the guide does not cover it: the setting lives here and travels in the
+        # dispatch message, so `gt_dir` cannot point at two different ground
+        # truths on two machines and produce one mAP number that means nothing
+        # (invariant 9).
+        map_cfg = config.get("map") or {}
+        self._map_enabled = bool(map_cfg.get("enabled", False))
+        self._map_dispatch = {
+            "enabled": self._map_enabled,
+            "gt_dir": map_cfg.get("gt_dir", "datasets/groundtruth"),
+            "window_batches": int(map_cfg.get("window_batches", 16)),
+        }
 
         # The infra host's window opens HERE, at controller start — before any
         # worker registers or anything is published — so the series contains the
@@ -286,7 +311,7 @@ class Server:
             gspan = group[-1] - group[-W]        # than the system does — correct, not a bug
             if gspan > 0:
                 group_line += f" window_fps={(W - 1) * self.batch_size / gspan:.2f}"
-        with open(self.group_rate_ns_path, "a") as f:
+        with open(self.fps_cluster_ns_path, "a") as f:
             f.write(group_line + "\n")
 
         ch.basic_ack(delivery_tag=method.delivery_tag)
@@ -382,7 +407,7 @@ class Server:
             print("  [SYSTEM FPS]      no DONEs received — nothing to report")
         print(f"  batches counted: {n}   stop reason: {reason}")
         print("=" * 60)
-        self._write_group_rate()
+        self._write_fps_cluster()
         # Every DONE is counted — now release the tiers kept alive to drain
         # the backlog (layers >= 2; the edges got their STOP at first-tier-done).
         self._log_event("system", f"drain complete, releasing clouds ({reason})")
@@ -395,7 +420,7 @@ class Server:
         # in start(), which closes the connection from the main frame.
         self._fps_shutdown = True
 
-    def _write_group_rate(self):
+    def _write_fps_cluster(self):
         """Throughput summary: one line per group + one SYSTEM line (01 §3.3).
 
         `fps` uses the SHARED START for every scope, with each scope's own last
@@ -424,18 +449,18 @@ class Server:
         lines.append(f"{t_ns} SYSTEM fps={sys_fps:.3f} done={total_done} "
                      f"frames={sys_frames} clusters={len(self._group_times)}")
         try:
-            with open(self.group_rate_path, "w") as f:
+            with open(self.fps_cluster_path, "w") as f:
                 f.write("\n".join(lines) + "\n")
             for line in lines:
                 src.Log.print_with_color(f"[FPS] {line}", "cyan")
         except Exception as e:
-            src.Log.print_with_color(f"[FPS] writing {self.group_rate_path} failed: {e}", "red")
+            src.Log.print_with_color(f"[FPS] writing {self.fps_cluster_path} failed: {e}", "red")
 
     # ─────────────── Utilization + latency collection (03, 04) ───────────────
 
     def _collect_utilization(self, timeout_s=30.0):
         """Drain utilization_queue into utilization.log, then roll the same
-        reports up into utilization_group.log and latency_group.log (03 §5).
+        reports up into utilization_cluster.log and latency_cluster.log (03 §5).
 
         Runs after the FPS summary — every device has (or is about to have)
         published its report, and the reports sit on the broker until fetched
@@ -473,13 +498,14 @@ class Server:
             src.Log.print_with_color(
                 f"[Utilization] Collected {len(reported)}/{len(expected)} reports before timeout",
                 "yellow")
-        self._write_utilization_group(reports)
-        self._write_latency_group(reports)
+        self._write_utilization_cluster(reports)
+        self._write_latency_cluster(reports)
         # Both optional families ride on the same reports and the same drain, so
         # turning one off costs the shutdown nothing: there is no extra queue to
         # poll and no extra timeout to burn (guide/README invariant 10).
         self._write_free_time(reports)
         self._write_message_size(reports)
+        self._write_map(reports)
         # Held, not written: the guard's own peaks are only final once its
         # monitor has stopped, and that happens after this drain (13 §4).
         self._guard_reports = [r["broker_guard"] for r in reports
@@ -489,7 +515,7 @@ class Server:
     def _cluster_of(report):
         return report.get("cluster") or "unknown"
 
-    def _write_utilization_group(self, reports):
+    def _write_utilization_cluster(self, reports):
         """Roll the per-device reports up per group and per group/role (01 §3.5).
 
         `utilization` is POOLED (Σbusy / Σtotal), weighting each device by how
@@ -529,12 +555,12 @@ class Server:
                      f"utilization={pooled * 100:.2f}% utilization_mean={mean * 100:.2f}% "
                      f"busy_s={busy / 1e9:.3f} total_s={total / 1e9:.3f}")
         try:
-            with open(self.util_group_path, "w") as f:
+            with open(self.util_cluster_path, "w") as f:
                 f.write("\n".join(lines) + "\n")
             src.Log.print_with_color(f"[Utilization] {lines[-1]}", "green")
         except Exception as e:
             src.Log.print_with_color(
-                f"[Utilization] writing {self.util_group_path} failed: {e}", "yellow")
+                f"[Utilization] writing {self.util_cluster_path} failed: {e}", "yellow")
 
     @staticmethod
     def _percentile(sorted_samples, q):
@@ -546,7 +572,7 @@ class Server:
         return sorted_samples[k - 1]
 
     def _latency_stats_line(self, t_ns, scope, kind, samples):
-        """One `latency_group.log` line from POOLED raw samples. Percentiles are
+        """One `latency_cluster.log` line from POOLED raw samples. Percentiles are
         never averaged across devices — that has no statistical meaning — so the
         devices ship raw arrays and the reduction happens once, here."""
         s = sorted(samples)
@@ -556,11 +582,11 @@ class Server:
                 f"p95_ms={self._percentile(s, 95):.3f} "
                 f"max_ms={s[-1]:.3f}")
 
-    def _write_latency_group(self, reports):
+    def _write_latency_cluster(self, reports):
         """Latency distributions per group/role, per group, and SYSTEM (01 §3.6).
 
         `service` spans the device's own get input -> output, so its samples sum
-        to that scope's `busy_s` in utilization_group.log — the conformance check
+        to that scope's `busy_s` in utilization_cluster.log — the conformance check
         that ties the two files together. `pipeline` adds any local buffering
         before the batch was ready. `e2e` spans two machines by definition and is
         reported only by the completing tier, so it carries no `role=`."""
@@ -591,18 +617,18 @@ class Server:
         if system_e2e:
             lines.append(self._latency_stats_line(t_ns, "SYSTEM", "e2e", system_e2e))
         try:
-            with open(self.latency_group_path, "w") as f:
+            with open(self.latency_cluster_path, "w") as f:
                 f.write(("\n".join(lines) + "\n") if lines else "")
             for line in lines:
                 src.Log.print_with_color(f"[Latency] {line}", "cyan")
         except Exception as e:
             src.Log.print_with_color(
-                f"[Latency] writing {self.latency_group_path} failed: {e}", "yellow")
+                f"[Latency] writing {self.latency_cluster_path} failed: {e}", "yellow")
 
     # ──────────────────── Free time (guide/10-free-time.md) ──────────────────
 
     def _write_free_time(self, reports):
-        """free_time.log, free_time_group.log and free_time_series.log (01 §3.8-3.10).
+        """free_time.log, free_time_cluster.log and free_time_series.log (01 §3.8-3.10).
 
         Free time is the wall clock in which a device did nothing AT ALL — no
         input, no compute, no encode, no transfer, no bookkeeping. It is neither
@@ -621,7 +647,7 @@ class Server:
         t_ns = time.time_ns()
         try:
             self._write_free_time_devices(t_ns, devices)
-            self._write_free_time_group(t_ns, devices)
+            self._write_free_time_cluster(t_ns, devices)
             self._write_free_time_series(t_ns, devices)
         except Exception as e:
             src.Log.print_with_color(f"[FreeTime] writing failed: {e}", "yellow")
@@ -666,7 +692,7 @@ class Server:
             f.write("\n".join(lines) + "\n")
         src.Log.print_with_color(f"[FreeTime] {len(lines)} device line(s)", "green")
 
-    def _write_free_time_group(self, t_ns, devices):
+    def _write_free_time_cluster(self, t_ns, devices):
         def pooled(group):
             free = sum(ft["free_ns"] for _, ft in group)
             span = sum(ft["span_ns"] for _, ft in group)
@@ -740,7 +766,7 @@ class Server:
         lines.append(f"{t_ns} SYSTEM devices={len(devices)} clusters={len(by_cluster)} "
                      f"machines={len(by_machine)} free={ratio:.2f}% free_mean={mean:.2f}% "
                      f"free_s={free / 1e9:.3f} span_s={span / 1e9:.3f}")
-        with open(self.free_time_group_path, "w") as f:
+        with open(self.free_time_cluster_path, "w") as f:
             f.write("\n".join(lines) + "\n")
         src.Log.print_with_color(f"[FreeTime] {lines[-1]}", "green")
 
@@ -822,6 +848,86 @@ class Server:
                 src.Log.print_with_color(f"[MsgSize] {line}", "cyan")
         except Exception as e:
             src.Log.print_with_color(f"[MsgSize] writing failed: {e}", "yellow")
+
+    # ────────────────────────── Accuracy (map.log) ───────────────────────────
+
+    def _write_map(self, reports):
+        """map.log + map_window.log — detection accuracy per cluster.
+
+        Outside the guide by design (README, Scope): every other file here is
+        independent of what the pipeline computes, and these two are the one
+        place the workload leaks into the results. They are written to the same
+        universal grammar (01 §1) so the same parser reads them, and they follow
+        the same all-or-none rule as the optional families — both files or
+        neither.
+
+        Only the COMPLETING tier reports accuracy, for the same reason it is the
+        only tier that reports e2e: it is the only one holding a final detection
+        to compare against ground truth. So there is one line per completing
+        device — carrying both `client=` and `cluster=`, the way utilization.log
+        and free_time.log are per device — and no `role=`, because every line
+        here is already the same role.
+
+        The SYSTEM line is a FRAME-WEIGHTED mean of the per-cluster values, and
+        says so with `pooling=frame_weighted`. It is not a pooled mAP: a true one
+        needs every detection in one place, and shipping those is tens of MB.
+        Labelling it is the same treatment the guide gives e2e latency — emitted,
+        but marked indicative rather than exact (04 §2.3)."""
+        if not self._map_enabled:
+            return
+        measured = [(self._cluster_of(r), r["map"]) for r in reports if r.get("map")]
+        if not measured:
+            src.Log.print_with_color(
+                "[mAP] enabled but no completing tier reported — nothing written", "yellow")
+            return
+        t_ns = time.time_ns()
+        try:
+            summary, series = [], []
+            total_frames = 0
+            weighted = {"map50": 0.0, "map5095": 0.0}
+            # Sort on an explicit key: two completing devices in one cluster tie
+            # on the first element, and the fallback comparison lands on the
+            # report dicts, which raises.
+            for cluster, report in sorted(
+                    measured, key=lambda cr: (cr[0], str(cr[1].get("client")))):
+                cluster = self._kv_safe(cluster)
+                frames = int(report.get("frames", 0))
+                total_frames += frames
+                for key in weighted:
+                    weighted[key] += float(report.get(key, 0.0)) * frames
+                summary.append(
+                    f"{t_ns} cluster={cluster} client={self._kv_safe(report.get('client'))} "
+                    f"frames={frames} matched={int(report.get('matched', 0))} "
+                    f"map50={float(report.get('map50', 0.0)):.4f} "
+                    f"map5095={float(report.get('map5095', 0.0)):.4f}")
+                # Offsets from that worker's own first batch, never a device
+                # timestamp — the leading column is the server's clock and
+                # nothing else in a shared file may be another machine's
+                # (invariant 1). `client=` rides every line for the same reason
+                # free_time_series.log carries it: two completing devices in one
+                # cluster both start at i=0, and without the id their series are
+                # indistinguishable and plot as one zig-zag.
+                client = self._kv_safe(report.get("client"))
+                for i, offset_s, batches, frames_w, m50, m5095 in report.get("series") or []:
+                    series.append(f"{t_ns} client={client} cluster={cluster} i={i} "
+                                  f"t_offset_s={offset_s:.3f} batches={batches} "
+                                  f"frames={frames_w} map50={m50:.4f} "
+                                  f"map5095={m5095:.4f}")
+            if total_frames:
+                summary.append(
+                    f"{t_ns} SYSTEM devices={len(measured)} "
+                    f"clusters={len({c for c, _ in measured})} frames={total_frames} "
+                    f"map50={weighted['map50'] / total_frames:.4f} "
+                    f"map5095={weighted['map5095'] / total_frames:.4f} "
+                    f"pooling=frame_weighted")
+            with open(self.map_path, "w") as f:
+                f.write("\n".join(summary) + "\n")
+            with open(self.map_window_path, "w") as f:
+                f.write(("\n".join(series) + "\n") if series else "")
+            for line in summary:
+                src.Log.print_with_color(f"[mAP] {line}", "cyan")
+        except Exception as e:
+            src.Log.print_with_color(f"[mAP] writing failed: {e}", "yellow")
 
     # ─────────────────── Archiving (guide/05-archiving.md) ───────────────────
 
@@ -943,6 +1049,7 @@ class Server:
                             # worker never reads one locally (invariant 9).
                             "free_time": self._free_time_dispatch,
                             "message_size": self._msg_size_dispatch,
+                            "map": self._map_dispatch,
                             # The publisher's share of the memory budget travels
                             # with the work too — a cap that lived in each
                             # worker's config file would be twelve caps.

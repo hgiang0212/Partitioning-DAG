@@ -6,8 +6,8 @@ one, and there is no point proving that a hand-written log file is conformant.
 
 So nothing here writes a log line itself. It fabricates a plausible run — arrival
 times, per-device timing, payload sizes, host memory — and pushes it through
-`Server.on_fps`, `Server._write_group_rate`, `_write_utilization_group`,
-`_write_latency_group`, `_write_free_time`, `_write_message_size`, the real
+`Server.on_fps`, `Server._write_fps_cluster`, `_write_utilization_cluster`,
+`_write_latency_cluster`, `_write_free_time`, `_write_message_size`, the real
 `FreeTimeTracker` / `MessageSizeRecorder`, and `BrokerRamSampler.write_summary`.
 What lands on disk is what a real run would land, so if the validator passes here
 it passes on the pipeline.
@@ -87,7 +87,7 @@ class VirtualTracker(FreeTimeTracker):
 # ─────────────────────────── the fabricated fleet ────────────────────────────
 # Two clusters, so the group roll-ups and the `share` column have something to
 # say. machine-3 hosts TWO device processes, which is what makes the MACHINE
-# union line in free_time_group.log a real test: two devices that are each half
+# union line in free_time_cluster.log a real test: two devices that are each half
 # free can keep one machine fully busy by interleaving.
 DEVICES = [
     # (client_id, role, cluster,   machine,     device, rel_start_s, span_s)
@@ -108,25 +108,28 @@ def build_server(run_dir):
     server = object.__new__(Server)
     server.log_path = str(run_dir)
     server.batch_log_path        = str(run_dir / "batch_done_ns.log")
-    server.group_rate_ns_path    = str(run_dir / "group_rate_ns.log")
-    server.group_rate_path       = str(run_dir / "group_rate.log")
+    server.fps_cluster_ns_path    = str(run_dir / "fps_cluster_ns.log")
+    server.fps_cluster_path       = str(run_dir / "fps_cluster.log")
     server.util_log_path         = str(run_dir / "utilization.log")
-    server.util_group_path       = str(run_dir / "utilization_group.log")
-    server.latency_group_path    = str(run_dir / "latency_group.log")
+    server.util_cluster_path       = str(run_dir / "utilization_cluster.log")
+    server.latency_cluster_path    = str(run_dir / "latency_cluster.log")
     server.events_path           = str(run_dir / "events_ns.log")
     server.free_time_path        = str(run_dir / "free_time.log")
-    server.free_time_group_path  = str(run_dir / "free_time_group.log")
+    server.free_time_cluster_path  = str(run_dir / "free_time_cluster.log")
     server.free_time_series_path = str(run_dir / "free_time_series.log")
     server.broker_ram_ns_path    = str(run_dir / "broker_ram_ns.log")
     server.broker_ram_path       = str(run_dir / "broker_ram.log")
     server.msg_size_path         = str(run_dir / "message_size.log")
     server.msg_size_series_path  = str(run_dir / "message_size_series.log")
+    server.map_path              = str(run_dir / "map.log")
+    server.map_window_path       = str(run_dir / "map_window.log")
     server.result_files = [
-        server.batch_log_path, server.group_rate_ns_path, server.group_rate_path,
-        server.util_log_path, server.util_group_path, server.latency_group_path,
-        server.events_path, server.free_time_path, server.free_time_group_path,
+        server.batch_log_path, server.fps_cluster_ns_path, server.fps_cluster_path,
+        server.util_log_path, server.util_cluster_path, server.latency_cluster_path,
+        server.events_path, server.free_time_path, server.free_time_cluster_path,
         server.free_time_series_path, server.broker_ram_ns_path,
         server.broker_ram_path, server.msg_size_path, server.msg_size_series_path,
+        server.map_path, server.map_window_path,
     ]
     for path in server.result_files:               # truncate, as a real run does
         open(path, "w").close()
@@ -137,6 +140,7 @@ def build_server(run_dir):
     server._fps_start_t = START_EPOCH_NS / 1e9
     server._free_time_enabled = True
     server._msg_size_enabled = True
+    server._map_enabled = True
     return server
 
 
@@ -242,6 +246,35 @@ def message_size_report(cluster, machine, n_messages, span_s):
     })
 
 
+def map_report(cluster, client, packages, span_s):
+    """A `Scheduler._map_report()` payload: whole-run accuracy plus one windowed
+    sample per `window_batches` batches.
+
+    The series drifts DOWN slightly over the run. A flat series would make the
+    chart look right while proving nothing — the whole reason map_window.log
+    exists beside map.log is to show accuracy that moved, and a fixture that
+    never moves cannot exercise that."""
+    window_batches = 16
+    n_windows = max(packages // window_batches, 1)
+    series, m50s, m5095s = [], [], []
+    for i in range(n_windows):
+        drift = 1.0 - 0.06 * (i / max(n_windows - 1, 1))
+        m50 = min(max(RNG.gauss(0.62 * drift, 0.011), 0.0), 1.0)
+        m5095 = min(max(m50 * RNG.gauss(0.70, 0.012), 0.0), m50)   # 50:95 <= @50
+        frames = window_batches * BATCH_SIZE
+        series.append((i, i * span_s / n_windows, window_batches, frames, m50, m5095))
+        m50s.append(m50)
+        m5095s.append(m5095)
+    return {
+        "client": str(client), "cluster": cluster,
+        "frames": packages * BATCH_SIZE,
+        "matched": n_windows * window_batches * BATCH_SIZE,
+        "map50": sum(m50s) / len(m50s),
+        "map5095": sum(m5095s) / len(m5095s),
+        "series": series,
+    }
+
+
 def build_reports(total_done):
     """One UTILIZATION report per device — the same dict a worker publishes."""
     per_cluster = {}
@@ -255,7 +288,7 @@ def build_reports(total_done):
 
         # `service` samples ARE the busy intervals utilization sums, so busy_ns
         # is derived from them rather than drawn independently. That identity is
-        # the conformance check tying latency_group.log to utilization_group.log
+        # the conformance check tying latency_cluster.log to utilization_cluster.log
         # (guide/04 §2.1) — faking them separately would fake the check away.
         centre = 2.6 if role == "edge" else 3.4
         service_ms = [max(RNG.gauss(centre * 1000, centre * 175), 90.0)
@@ -282,6 +315,10 @@ def build_reports(total_done):
             "free_time": free_time_report(rel_start, span_s, busy_fraction,
                                           RNG.uniform(8.0, 61.0), machine),
             "message_size": None,
+            # Accuracy comes from the COMPLETING tier only, exactly like e2e:
+            # it is the only tier holding a final detection to score.
+            "map": (map_report(cluster, client_id, packages, span_s)
+                    if role == "cloud" else None),
         }
         reports.append(report)
 
@@ -366,15 +403,16 @@ def main():
         server = build_server(run_dir)
         last_ns = drive_arrivals(server, clock)
         clock.epoch_ns = last_ns + int(0.4 * 1e9)
-        server._write_group_rate()
+        server._write_fps_cluster()
 
         reports = build_reports(len(server._fps_times))
         write_utilization_lines(server, reports, clock, last_ns)
         clock.epoch_ns = last_ns + int(3.1 * 1e9)
-        server._write_utilization_group(reports)
-        server._write_latency_group(reports)
+        server._write_utilization_cluster(reports)
+        server._write_latency_cluster(reports)
         server._write_free_time(reports)
         server._write_message_size(reports)
+        server._write_map(reports)
         write_broker_ram(server, run_dir, last_ns)
     finally:
         server_module.time = real_time

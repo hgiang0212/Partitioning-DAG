@@ -54,6 +54,22 @@ message_size:             # guide/12 — bytes one worker puts on the wire
                           # statistics still use every sample
   mode: split             # context recorded beside the size, so it is reproducible
 
+map:                      # detection accuracy — map.log / map_window.log.
+  enabled: True           # NOT a guide family: guide/README puts mAP out of
+                          # scope, because nothing else measured here depends on
+                          # ground truth or on the work being a detection task.
+                          # Emitted to the same grammar so one parser reads it.
+  gt_dir: datasets/groundtruth   # travels in the dispatch message like every
+                          # other flag: two machines scoring against two
+                          # different ground truths would produce one averaged
+                          # number that means nothing (invariant 9)
+  window_batches: 16      # one map_window.log line per this many batches, each
+                          # scored by its own metric over only its own frames.
+                          # 16 matches the throughput window W, so an accuracy
+                          # dip lines up with the FPS series it should be read
+                          # against. Batches, not seconds: frames only exist in
+                          # batch units, and a time bucket would split one.
+
 broker_guard:             # guide/13 — the LIMIT on the broker's RAM (11 only measures it)
   enabled: True
   max_broker_ram_mb: 1024 # the whole point: RabbitMQ stays under 1 GB

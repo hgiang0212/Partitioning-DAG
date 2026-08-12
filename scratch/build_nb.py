@@ -55,10 +55,11 @@ def guarded_code(condition, reason, body):
 md(rf"""
 # Split Inference — Distributed Run Results
 
-Charts are generated from the seven-file result format in
-`guide/01-result-format.md` (naming scheme: **`group_*` filenames, `cluster=` keys**).
-Every run directory under `{RESULTS}` that contains a `batch_done_ns.log` is picked
-up automatically, so adding a run needs no edit here.
+Charts are generated from the result format in `guide/01-result-format.md`
+(naming scheme: the **`*_cluster` set** — `fps_cluster*`, `utilization_cluster`,
+`latency_cluster`, `free_time_cluster` — carrying `cluster=` keys; one scheme per
+project, never mixed). Every run directory under `{RESULTS}` that contains a
+`batch_done_ns.log` is picked up automatically, so adding a run needs no edit here.
 
 Images are written to `results/imgs/`.
 
@@ -70,18 +71,27 @@ charts facet by run and 09 appears.
 | Input file | Feeds |
 |---|---|
 | `batch_done_ns.log` | 02 |
-| `group_rate_ns.log` | 03, 04 |
-| `group_rate.log` | 01, 09, 00 |
+| `fps_cluster_ns.log` | 03, 04 |
+| `fps_cluster.log` | 01, 09, 00 |
 | `utilization.log` | 08 |
-| `utilization_group.log` | 07, 09 |
-| `latency_group.log` | 05, 06, 09 |
+| `utilization_cluster.log` | 07, 09 |
+| `latency_cluster.log` | 05, 06, 09 |
 | `events_ns.log` | 02 (vertical rules) |
+| `free_time*.log` | 10, 11, 12 |
+| `broker_ram*.log` | 13, 14 (subtitle) |
+| `message_size*.log` | 14 |
+| `map.log`, `map_window.log` | 15 |
+
+`map.log` and `map_window.log` are **not** a guide family: `guide/README` puts
+model-accuracy metrics out of scope, since nothing else measured here depends on
+ground truth or on the work being a detection task. They are written to the same
+universal grammar anyway, so the one parser core reads them too.
 
 Before charting, confirm the inputs are conformant:
 
 ```
-python guide/validate_results.py <run-dir> --names group      # the six required files
-python scratch/validate_optional.py <run-dir>                 # files 8-14
+python guide/validate_results.py <run-dir> --names cluster    # the six required files
+python scratch/validate_optional.py <run-dir>                 # files 8-14 + accuracy
 ```
 
 **No results yet?** `python scratch/make_synthetic_run.py` fabricates a run and
@@ -316,7 +326,7 @@ def scope_of(flags, kv):
 ''')
 
 code(r'''
-def parse_rate_summary(run, path):                    # group_rate.log
+def parse_rate_summary(run, path):                    # fps_cluster.log
     rows = []
     for ln in read_lines(path):
         ts, flags, kv = parse_kv_line(ln)
@@ -333,7 +343,7 @@ def parse_rate_summary(run, path):                    # group_rate.log
                          share=num(kv.get("share"))))
     return rows
 
-def parse_rate_timeline(run, path):                   # group_rate_ns.log
+def parse_rate_timeline(run, path):                   # fps_cluster_ns.log
     rows = []
     for ln in read_lines(path):
         ts, _, kv = parse_kv_line(ln)
@@ -355,7 +365,7 @@ def parse_batch_done(run, path):                      # batch_done_ns.log — TW
                              window_fps=float(parts[1])))
     return rows
 
-def parse_latency(run, path):                         # latency_group.log
+def parse_latency(run, path):                         # latency_cluster.log
     rows = []
     for ln in read_lines(path):
         ts, flags, kv = parse_kv_line(ln)
@@ -369,7 +379,7 @@ def parse_latency(run, path):                         # latency_group.log
                          max_ms=num(kv.get("max_ms"))))
     return rows
 
-def parse_util_group(run, path):                      # utilization_group.log
+def parse_util_group(run, path):                      # utilization_cluster.log
     rows = []
     for ln in read_lines(path):
         ts, flags, kv = parse_kv_line(ln)
@@ -429,7 +439,7 @@ def parse_free_time_device(run, path):                # free_time.log
                          host_idle=num(kv.get("host_idle"))))
     return rows
 
-def parse_free_time_group(run, path):                 # free_time_group.log
+def parse_free_time_cluster(run, path):                 # free_time_cluster.log
     """Six line kinds in one file, told apart by their FLAGS. `line_kind` is a
     deliberate name: a column called `kind` collides with the KIND lines' own
     `kind=` key, and one named `agg` would be shadowed by DataFrame.agg."""
@@ -536,6 +546,36 @@ def parse_message_series(run, path):                  # message_size_series.log
                          batch_id=num(kv.get("batch_id")),
                          n_bytes=num(kv.get("bytes")), mb=num(kv.get("mb"))))
     return rows
+
+def parse_map(run, path):                             # map.log
+    rows = []
+    for ln in read_lines(path):
+        ts, flg, kv = parse_kv_line(ln)
+        if "map50" not in kv:
+            continue
+        rows.append(dict(run=run,
+                         scope=("System" if "SYSTEM" in flg
+                                else group_label(kv.get("cluster"))),
+                         client=kv.get("client"), pooling=kv.get("pooling"),
+                         frames=num(kv.get("frames")),
+                         matched=num(kv.get("matched")),
+                         map50=num(kv.get("map50")),
+                         map5095=num(kv.get("map5095"))))
+    return rows
+
+def parse_map_window(run, path):                      # map_window.log
+    rows = []
+    for ln in read_lines(path):
+        ts, _, kv = parse_kv_line(ln)
+        if "map50" not in kv:
+            continue
+        rows.append(dict(run=run, client=kv.get("client"),
+                         cluster=group_label(kv.get("cluster")),
+                         i=int(num(kv.get("i"))), t_offset_s=num(kv.get("t_offset_s")),
+                         batches=num(kv.get("batches")), frames=num(kv.get("frames")),
+                         map50=num(kv.get("map50")),
+                         map5095=num(kv.get("map5095"))))
+    return rows
 ''')
 
 
@@ -571,25 +611,32 @@ COLS = {
               "per_frame_mb"],
     "mss":   ["run", "client", "cluster", "i", "t_offset_s", "batch_id",
               "n_bytes", "mb"],
+    # Accuracy — a project extension, not a guide family (guide/README, Scope).
+    "map":   ["run", "scope", "client", "pooling", "frames", "matched",
+              "map50", "map5095"],
+    "mapw":  ["run", "client", "cluster", "i", "t_offset_s", "batches",
+              "frames", "map50", "map5095"],
 }
 
 def load_all():
     rows = {k: [] for k in COLS}
     ram_sum = []
     for run, d in RUNS.items():
-        rows["rate"]  += parse_rate_summary(run,  d / "group_rate.log")
-        rows["tl"]    += parse_rate_timeline(run, d / "group_rate_ns.log")
+        rows["rate"]  += parse_rate_summary(run,  d / "fps_cluster.log")
+        rows["tl"]    += parse_rate_timeline(run, d / "fps_cluster_ns.log")
         rows["batch"] += parse_batch_done(run,    d / "batch_done_ns.log")
-        rows["lat"]   += parse_latency(run,       d / "latency_group.log")
-        rows["utg"]   += parse_util_group(run,    d / "utilization_group.log")
+        rows["lat"]   += parse_latency(run,       d / "latency_cluster.log")
+        rows["utg"]   += parse_util_group(run,    d / "utilization_cluster.log")
         rows["utd"]   += parse_util_device(run,   d / "utilization.log")
         rows["ev"]    += parse_events(run,        d / "events_ns.log")
         rows["ftd"]   += parse_free_time_device(run, d / "free_time.log")
-        rows["ftg"]   += parse_free_time_group(run,  d / "free_time_group.log")
+        rows["ftg"]   += parse_free_time_cluster(run,  d / "free_time_cluster.log")
         rows["fts"]   += parse_free_time_series(run, d / "free_time_series.log")
         rows["ram"]   += parse_broker_ram(run,       d / "broker_ram_ns.log")
         rows["msz"]   += parse_message_size(run,     d / "message_size.log")
         rows["mss"]   += parse_message_series(run,   d / "message_size_series.log")
+        rows["map"]   += parse_map(run,              d / "map.log")
+        rows["mapw"]  += parse_map_window(run,       d / "map_window.log")
         ram_sum       += parse_broker_summary(run,   d / "broker_ram.log")
     frames = {k: pd.DataFrame(v, columns=COLS[k]) for k, v in rows.items()}
     frames["ram_sum"] = pd.DataFrame(ram_sum)
@@ -600,6 +647,7 @@ df_rate, df_tl, df_batch = F["rate"], F["tl"], F["batch"]
 df_lat, df_utg, df_utd, df_events = F["lat"], F["utg"], F["utd"], F["ev"]
 df_ftd, df_ftg, df_fts = F["ftd"], F["ftg"], F["fts"]
 df_ram, df_ram_sum, df_msz, df_mss = F["ram"], F["ram_sum"], F["msz"], F["mss"]
+df_map, df_mapw = F["map"], F["mapw"]
 
 for name, df in [("rate summary", df_rate), ("rate timeline", df_tl),
                  ("batch timeline", df_batch), ("latency", df_lat),
@@ -607,7 +655,8 @@ for name, df in [("rate summary", df_rate), ("rate timeline", df_tl),
                  ("events", df_events), ("free time/device", df_ftd),
                  ("free time/group", df_ftg), ("free time/series", df_fts),
                  ("broker ram", df_ram), ("message size", df_msz),
-                 ("message size/series", df_mss)]:
+                 ("message size/series", df_mss), ("accuracy", df_map),
+                 ("accuracy/window", df_mapw)]:
     print(f"{name:<22} {df.shape}")
 
 # Which optional families this run actually carries. The charts consume these
@@ -616,8 +665,9 @@ for name, df in [("rate summary", df_rate), ("rate timeline", df_tl),
 HAS_FREE_TIME = len(df_ftd) > 0
 HAS_RAM       = len(df_ram) > 0
 HAS_MSG_SIZE  = len(df_msz) > 0
+HAS_MAP       = len(df_map) > 0
 print(f"\noptional families: free_time={HAS_FREE_TIME}  broker_ram={HAS_RAM}  "
-      f"message_size={HAS_MSG_SIZE}")
+      f"message_size={HAS_MSG_SIZE}  map={HAS_MAP}")
 
 # Entity colour dicts, built ONCE from every group seen across all runs, so a
 # chart that filters to one run never repaints the survivors.
@@ -724,7 +774,7 @@ if HAS_MSG_SIZE:
 md("""
 ## 01 · Throughput by cluster
 
-`group_rate.log`. The two series are the two throughput questions: **whole run**
+`fps_cluster.log`. The two series are the two throughput questions: **whole run**
 (`fps`, warm-up included — what the user experienced) and **steady state**
 (`steady_fps`, warm-up dropped — what you compare configurations with).
 
@@ -733,7 +783,7 @@ correctly shows one bar. **Cluster bars do not sum to the System bar** and shoul
 not be expected to — each cluster divides by its own span.
 """)
 guarded_code("not len(df_rate)",
-             "group_rate.log has no rows — 01 skipped.", r'''
+             "fps_cluster.log has no rows — 01 skipped.", r'''
 n_panels = max(len(RUN_ORDER), 1)
 fig, axes = plt.subplots(1, n_panels, figsize=(7.6 * n_panels, 4.9), sharey=True)
 axes = np.atleast_1d(axes)
@@ -831,12 +881,12 @@ finish(fig, "02_system_window_fps.png")
 md("""
 ## 03 · Throughput per cluster over the run
 
-`group_rate_ns.log`, same seconds axis as 02. A cluster reaches its first full
+`fps_cluster_ns.log`, same seconds axis as 02. A cluster reaches its first full
 window later than the system does, and clusters end at different times — both are
 correct, not truncated series.
 """)
 guarded_code("not len(df_tl)",
-             "group_rate_ns.log has no windowed rows — 03 skipped.", r'''
+             "fps_cluster_ns.log has no windowed rows — 03 skipped.", r'''
 n_panels = max(len(RUN_ORDER), 1)
 fig, axes = plt.subplots(n_panels, 1, figsize=(13, 3.9 * n_panels), sharex=False)
 axes = np.atleast_1d(axes)
@@ -879,7 +929,7 @@ A high mean with a wide box is a worse result than a slightly lower mean with a
 tight one.
 """)
 guarded_code("not len(df_tl)",
-             "group_rate_ns.log has no windowed rows — 04 skipped.", r'''
+             "fps_cluster_ns.log has no windowed rows — 04 skipped.", r'''
 fig, ax = plt.subplots(figsize=(9.0, 4.9))
 
 positions, data, colors = [], [], []
@@ -939,7 +989,7 @@ panel is honestly its own scale and the panel titles say which is which.
 device speed (04 §2.2).
 """)
 guarded_code('not (df_lat.kind == "service").any()',
-             "latency_group.log has no kind=service rows — 05 skipped.", r'''
+             "latency_cluster.log has no kind=service rows — 05 skipped.", r'''
 svc = df_lat[df_lat.kind == "service"]
 panel_roles = ROLES or ["all"]
 # One x slot per cluster, or per cluster x run when several runs are loaded.
@@ -992,7 +1042,7 @@ md("""
 inherits any offset between their clocks (04 §2.3).
 """)
 guarded_code('not (df_lat.kind == "e2e").any()',
-             "latency_group.log has no kind=e2e rows — 06 skipped.", r'''
+             "latency_cluster.log has no kind=e2e rows — 06 skipped.", r'''
 e2e = df_lat[df_lat.kind == "e2e"]
 stats  = [("mean_ms", "Mean"), ("p50_ms", "p50"), ("p95_ms", "p95"), ("max_ms", "Max")]
 scopes = [s for s in SCOPES if (e2e.scope == s).any()]
@@ -1039,7 +1089,7 @@ Pooled `utilization` (Σbusy / Σtotal). Where it diverges from `utilization_mea
 the group is imbalanced (03 §6) — both are annotated on the `ALL` rows.
 """)
 guarded_code("not len(df_utg)",
-             "utilization_group.log has no rows — 07 skipped.", r'''
+             "utilization_cluster.log has no rows — 07 skipped.", r'''
 rows, labels = [], []
 for g in GROUPS:
     for r in ROLES:
@@ -1317,7 +1367,7 @@ else:
 md("""
 ## 11 · Why the fleet was free, and where the busy time went
 
-`free_time_group.log`. Two panels because the two breakdowns have **different
+`free_time_cluster.log`. Two panels because the two breakdowns have **different
 totals**, and putting them on one axis would imply they are comparable:
 
 - **`FREE reason=` sums to exactly 100%** of the scope's free time. Attribution is
@@ -1328,7 +1378,7 @@ totals**, and putting them on one axis would imply they are comparable:
 """)
 code(r'''
 if not HAS_FREE_TIME:
-    print("free_time_group.log absent or empty — 11 skipped.")
+    print("free_time_cluster.log absent or empty — 11 skipped.")
 else:
     reasons = df_ftg[df_ftg.line_kind == "reason"]
     kinds   = df_ftg[df_ftg.line_kind == "kind"]
@@ -1589,6 +1639,75 @@ else:
 ''')
 
 
+# ─────────────────────────────── 15 ──────────────────────────────────────────
+md("""
+## 15 · Detection accuracy over the run
+
+`map.log` + `map_window.log`. **Not a guide family** — `guide/README` puts mAP
+out of scope, because nothing else measured here depends on ground truth or on
+the work being a detection task. It is charted last for that reason.
+
+The series is what the whole-run number cannot tell you: whether accuracy
+**drifted**. Each window is scored by its own metric over only its own frames, so
+a late collapse shows as a falling line instead of being averaged away into the
+headline. Two lines because mAP@50 and mAP@50:95 answer different questions —
+the second averages over stricter IoU thresholds and is always the lower of the
+two, which is why a crossing would be a measurement bug rather than a result.
+
+The **System** value is a frame-weighted mean of the per-device numbers, not a
+pooled mAP: a true pooling needs every detection in one place. It is labelled
+`pooling=frame_weighted` in the file and stated in the subtitle here, the same
+way `e2e` latency is labelled indicative rather than exact.
+""")
+code(r'''
+if not HAS_MAP:
+    print("map.log absent or empty — 15 skipped (needs map.enabled and ground truth).")
+else:
+    run = RUN_ORDER[0] if RUN_ORDER else None
+    window = (df_mapw[df_mapw.run == run] if run else df_mapw)
+    summary = (df_map[df_map.run == run] if run else df_map)
+    system = summary[summary.scope == "System"]
+
+    fig, ax = plt.subplots(figsize=(12.4, 4.7))
+    SERIES = [("map50", "mAP@50", S1), ("map5095", "mAP@50:95", S2)]
+    if len(window):
+        # One line per metric, pooled across completing devices at each window
+        # index: the question is "did accuracy move over the run", and one line
+        # per device per metric is four lines answering it twice.
+        pooled = (window.groupby("i")
+                        .agg(t_offset_s=("t_offset_s", "mean"),
+                             map50=("map50", "mean"), map5095=("map5095", "mean"))
+                        .reset_index().sort_values("i"))
+        for col, lbl, colour in SERIES:
+            ax.plot(pooled.t_offset_s, pooled[col], color=colour, label=lbl, **LINE_KW)
+            endpoint(ax, pooled.t_offset_s.iloc[-1], float(pooled[col].iloc[-1]),
+                     colour, fmt="{:.3f}")
+        # Whole-run reference for each metric: same hue, thinner, receding.
+        if len(system):
+            for col, _lbl, colour in SERIES:
+                ax.axhline(float(system.iloc[0][col]), color=colour,
+                           linewidth=1.0, alpha=0.45)
+
+    # mAP is a ratio in [0, 1]. Fix the ceiling the way the utilization charts
+    # do — autoscaling a 0.59-0.62 band to fill the panel turns ordinary window
+    # noise into a dramatic collapse.
+    ax.set_ylim(0, 1.0)
+    ax.set_xlabel("seconds since that device's own first scored frame")
+    ax.set_ylabel("mAP (0-1, higher is better)")
+    ax.grid(axis="x", visible=False)
+    legend_above(ax, ncol=2, side="right")
+    ax.set_title("Detection accuracy over the run", pad=30)
+    if len(system):
+        s = system.iloc[0]
+        subtitle(ax, f"whole run: mAP@50 {s.map50:.3f} · mAP@50:95 "
+                     f"{s.map5095:.3f} over {s.frames:,.0f} frames — "
+                     f"{s.pooling.replace('_', '-')} across "
+                     f"{len(summary[summary.scope != 'System'])} completing "
+                     f"device(s), indicative rather than pooled")
+    finish(fig, "15_map_over_run.png")
+''')
+
+
 # ─────────────────────────────── 00 ──────────────────────────────────────────
 md("""
 ## 00 · Hero stat tile
@@ -1630,19 +1749,24 @@ for f in SAVED:
 
 COVERAGE = {
     "batch_done_ns.log":       ("required", ["02", "13"]),
-    "group_rate_ns.log":       ("required", ["03", "04"]),
-    "group_rate.log":          ("required", ["01", "09", "00"]),
+    "fps_cluster_ns.log":       ("required", ["03", "04"]),
+    "fps_cluster.log":          ("required", ["01", "09", "00"]),
     "utilization.log":         ("required", ["08"]),
-    "utilization_group.log":   ("required", ["07", "09"]),
-    "latency_group.log":       ("required", ["05", "06", "09"]),
+    "utilization_cluster.log":   ("required", ["07", "09"]),
+    "latency_cluster.log":       ("required", ["05", "06", "09"]),
     "events_ns.log":           ("optional", ["02 (rules; nothing drawn if absent)"]),
     "free_time.log":           ("optional", ["10", "12"]),
-    "free_time_group.log":     ("optional", ["11"]),
+    "free_time_cluster.log":     ("optional", ["11"]),
     "free_time_series.log":    ("optional", ["12"]),
     "broker_ram_ns.log":       ("optional", ["13"]),
     "broker_ram.log":          ("optional", ["13 (COMPARE subtitle)", "14"]),
     "message_size.log":        ("optional", ["14"]),
     "message_size_series.log": ("optional", ["14"]),
+    # Not a guide family — accuracy is out of scope in guide/README, and these
+    # two are this project's own extension. Listed here so the coverage check
+    # still accounts for every file the run directory holds.
+    "map.log":                 ("extra",    ["15"]),
+    "map_window.log":          ("extra",    ["15"]),
 }
 print("\nCoverage — every log that this run produced feeds at least one chart:")
 for log, (need, charts) in COVERAGE.items():

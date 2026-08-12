@@ -13,6 +13,10 @@ way that measurement is usually wrong:
   message size min <= p50 <= p95 <= max, and exactly one worker measured
   broker guard the per-queue caps must SUM to the budget, resume < high < cap, and
                a limit nobody observed is reported as `unknown`, never as held
+  accuracy     (map.log / map_window.log — a project extension, NOT a guide
+               family) ratios stay in [0, 1], mAP@50:95 never exceeds mAP@50, and
+               the SYSTEM line names its pooling because it is a weighted mean
+               rather than a real pooled mAP
 
     python scratch/validate_optional.py <run-dir>
 """
@@ -49,7 +53,7 @@ def flags(line):
 
 def check_free_time(d, errs, warns, notes):
     dev, group, series = (read(d / "free_time.log"),
-                          read(d / "free_time_group.log"),
+                          read(d / "free_time_cluster.log"),
                           read(d / "free_time_series.log"))
     present = [x is not None for x in (dev, group, series)]
     if not any(present):
@@ -86,7 +90,7 @@ def check_free_time(d, errs, warns, notes):
         if "ALL" in fl and scope:
             by_scope_free[scope] = num(k.get("free_s"))
             if "free_mean" not in k:
-                errs.append(f"free_time_group.log:{i}: ALL lines must carry free_mean "
+                errs.append(f"free_time_cluster.log:{i}: ALL lines must carry free_mean "
                             f"beside free")
             all_lines += 1
         if "FREE" in fl:
@@ -96,17 +100,17 @@ def check_free_time(d, errs, warns, notes):
             kinds.setdefault(scope, 0.0)
             kinds[scope] += num(k.get("busy_s"))
         if "SYSTEM" in fl and "free_mean" not in k:
-            errs.append(f"free_time_group.log:{i}: SYSTEM line must carry free_mean")
+            errs.append(f"free_time_cluster.log:{i}: SYSTEM line must carry free_mean")
 
     for scope, entries in reasons.items():
         share = sum(s for _, _, s in entries)
         total = sum(v for _, v, _ in entries)
         if abs(share - 100.0) > 0.5:
-            errs.append(f"free_time_group.log: FREE reason shares for {scope} sum to "
+            errs.append(f"free_time_cluster.log: FREE reason shares for {scope} sum to "
                         f"{share:.2f}%, expected 100% (attribution double-counts or "
                         f"leaks; `unaccounted` must absorb the remainder)")
         if scope in by_scope_free and abs(total - by_scope_free[scope]) > 0.05:
-            errs.append(f"free_time_group.log: FREE reasons for {scope} sum to "
+            errs.append(f"free_time_cluster.log: FREE reasons for {scope} sum to "
                         f"{total:.3f}s but the ALL line says free_s="
                         f"{by_scope_free[scope]:.3f}s")
     if reasons:
@@ -119,7 +123,7 @@ def check_free_time(d, errs, warns, notes):
         merged = sum(num(kv(l).get("busy_s")) for l in dev
                      if kv(l).get("cluster") == scope)
         if merged and kind_sum <= merged + TOL:
-            errs.append(f"free_time_group.log: per-kind busy for {scope} sums to "
+            errs.append(f"free_time_cluster.log: per-kind busy for {scope} sums to "
                         f"{kind_sum:.3f}s, not MORE than the merged busy {merged:.3f}s "
                         f"— on a pipelined worker that means the lanes are being "
                         f"SUMMED instead of merged")
@@ -241,6 +245,91 @@ def check_message_size(d, errs, warns, notes):
     notes.append(f"message size: 1 worker, n={k.get('n')} messages, "
                  f"mean={k.get('mean_mb')} MB, series {len(series)} row(s) "
                  f"(decimated from {k.get('n')})")
+
+
+def check_map(d, errs, warns, notes):
+    """Accuracy is NOT a guide family — guide/README puts mAP out of scope — so
+    these invariants are this project's own. They are the ones that catch a mAP
+    that is quietly meaningless:
+
+      - a ratio outside [0, 1] means the metric was scaled or averaged wrong
+      - mAP@50:95 is an average that INCLUDES the .50 threshold, so it can never
+        exceed mAP@50; if it does, the two are swapped
+      - `matched` may not exceed `frames`: you cannot score more frames against
+        ground truth than the tier produced
+      - the SYSTEM line is a frame-weighted mean, not a pooled mAP, and MUST say
+        so — an unlabelled one reads as exact and is not
+      - a window series that carries no `client=` cannot be separated when two
+        completing devices share a cluster
+    """
+    summary, series = read(d / "map.log"), read(d / "map_window.log")
+    if summary is None and series is None:
+        notes.append("accuracy: not emitted (project extension, all-or-none) — skipped")
+        return
+    if summary is None or series is None:
+        errs.append("accuracy: map.log and map_window.log are one feature — "
+                    "emit both or neither")
+        return
+    if not summary:
+        notes.append("accuracy: files present but empty (feature off this run)")
+        return
+
+    sys_lines = [l for l in summary if "SYSTEM" in flags(l)]
+    dev_lines = [l for l in summary if "SYSTEM" not in flags(l)]
+    for i, line in enumerate(summary, 1):
+        k = kv(line)
+        m50, m5095 = num(k.get("map50")), num(k.get("map5095"))
+        for name, value in (("map50", m50), ("map5095", m5095)):
+            if not (0.0 <= value <= 1.0):
+                errs.append(f"map.log:{i}: {name}={k.get(name)} outside [0, 1] "
+                            f"— mAP is a ratio, never a percentage here")
+        if m5095 > m50 + 1e-9:
+            errs.append(f"map.log:{i}: map5095={k.get('map5095')} exceeds "
+                        f"map50={k.get('map50')} — mAP@50:95 averages over "
+                        f"thresholds that include .50, so it cannot be higher")
+        if "role" in k:
+            errs.append(f"map.log:{i}: must not carry role= — only the completing "
+                        f"tier scores accuracy, so every line is the same role")
+    for i, line in enumerate(dev_lines, 1):
+        k = kv(line)
+        if "client" not in k or "cluster" not in k:
+            errs.append(f"map.log:{i}: device lines need both client= and cluster=")
+        if num(k.get("matched")) > num(k.get("frames")):
+            errs.append(f"map.log:{i}: matched={k.get('matched')} exceeds "
+                        f"frames={k.get('frames')} — more frames scored than produced")
+    if len(sys_lines) > 1:
+        errs.append(f"map.log: expected at most 1 SYSTEM line, found {len(sys_lines)}")
+    for line in sys_lines:
+        if kv(line).get("pooling") != "frame_weighted":
+            errs.append("map.log: the SYSTEM line MUST carry pooling=frame_weighted. "
+                        "A true pooled mAP needs every detection in one place; this "
+                        "is a weighted mean and an unlabelled one reads as exact")
+
+    idx_by_client = {}
+    for line in series:
+        k = kv(line)
+        if "client" not in k:
+            errs.append("map_window.log: every row needs client= — two completing "
+                        "devices in one cluster both start at i=0")
+            break
+        idx_by_client.setdefault(k["client"], []).append(int(num(k.get("i", -1))))
+    for client, idx in idx_by_client.items():
+        if idx != sorted(idx):
+            errs.append(f"map_window.log: i must stay non-decreasing (client={client})")
+    for i, line in enumerate(series, 1):
+        k = kv(line)
+        for required in ("t_offset_s", "batches", "frames", "map50", "map5095"):
+            if required not in k:
+                errs.append(f"map_window.log:{i}: missing {required}=")
+                break
+        if num(k.get("map5095")) > num(k.get("map50")) + 1e-9:
+            errs.append(f"map_window.log:{i}: map5095 exceeds map50")
+    if sys_lines:
+        k = kv(sys_lines[0])
+        notes.append(f"accuracy: {len(dev_lines)} completing device(s) over "
+                     f"{k.get('clusters')} cluster(s), SYSTEM map50={k.get('map50')} "
+                     f"map5095={k.get('map5095')} ({k.get('pooling')}), "
+                     f"{len(series)} window row(s)")
 
 
 def check_broker_guard(d, errs, warns, notes):
@@ -383,6 +472,7 @@ def main(run_dir):
     check_free_time(d, errs, warns, notes)
     check_broker_ram(d, errs, warns, notes)
     check_message_size(d, errs, warns, notes)
+    check_map(d, errs, warns, notes)
     check_broker_guard(d, errs, warns, notes)
 
     print(f"\noptional-family checks for {d}")
