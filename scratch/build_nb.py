@@ -310,7 +310,11 @@ def group_label(raw):
         return None
     if raw == "unknown":
         return "Untagged"
-    m = re.fullmatch(r"queue_(\d+)", raw)
+    # The id is the QUEUE an edge publishes to, and this project names those
+    # `intermediate_queue_2` where the guide's examples say `queue_2`. Match on
+    # the trailing index so both land on the same display label — anchoring the
+    # whole string put a raw queue name on every axis of every chart.
+    m = re.search(r"queue_(\d+)$", raw)
     return f"Cluster {m.group(1)}" if m else raw
 
 def short_label(scope):
@@ -547,34 +551,52 @@ def parse_message_series(run, path):                  # message_size_series.log
                          n_bytes=num(kv.get("bytes")), mb=num(kv.get("mb"))))
     return rows
 
+# Accuracy is this project's OWN extension, not a guide family, so its earlier
+# spelling is this project's to keep reading. Runs archived before the rename
+# carry `mAP50=` / `mAP50_95=` — uppercase, which guide/01 §1 does not allow —
+# and index their windows with `window=` instead of `i=` plus offsets. Aliasing
+# the two spellings at the parser is four lines; the alternative is chart 15
+# silently vanishing on every archive older than the rename, which is exactly
+# how a missing chart gets read as "this run had no accuracy".
+MAP_KEYS = {"map50": ("map50", "mAP50"), "map5095": ("map5095", "mAP50_95")}
+
+def map_num(kv, name):
+    return next((num(kv[k]) for k in MAP_KEYS[name] if k in kv), np.nan)
+
 def parse_map(run, path):                             # map.log
     rows = []
     for ln in read_lines(path):
         ts, flg, kv = parse_kv_line(ln)
-        if "map50" not in kv:
+        # A pre-rename file carries TWO lines per scope: WINDOW (the mean over
+        # windows) and ALL (the whole run). The whole-run number is the one the
+        # reference lines and the subtitle mean, and the only one the current
+        # format writes at all — so the restatement is dropped, not averaged in.
+        if np.isnan(map_num(kv, "map50")) or "WINDOW" in flg:
             continue
         rows.append(dict(run=run,
-                         scope=("System" if "SYSTEM" in flg
+                         scope=("System" if {"SYSTEM", "OVERALL"} & set(flg)
                                 else group_label(kv.get("cluster"))),
                          client=kv.get("client"), pooling=kv.get("pooling"),
                          frames=num(kv.get("frames")),
                          matched=num(kv.get("matched")),
-                         map50=num(kv.get("map50")),
-                         map5095=num(kv.get("map5095"))))
+                         map50=map_num(kv, "map50"),
+                         map5095=map_num(kv, "map5095")))
     return rows
 
 def parse_map_window(run, path):                      # map_window.log
     rows = []
     for ln in read_lines(path):
         ts, _, kv = parse_kv_line(ln)
-        if "map50" not in kv:
+        if np.isnan(map_num(kv, "map50")):
             continue
+        idx = num(kv.get("i", kv.get("window")))
         rows.append(dict(run=run, client=kv.get("client"),
                          cluster=group_label(kv.get("cluster")),
-                         i=int(num(kv.get("i"))), t_offset_s=num(kv.get("t_offset_s")),
+                         i=int(idx) if np.isfinite(idx) else len(rows),
+                         t_offset_s=num(kv.get("t_offset_s")),
                          batches=num(kv.get("batches")), frames=num(kv.get("frames")),
-                         map50=num(kv.get("map50")),
-                         map5095=num(kv.get("map5095"))))
+                         map50=map_num(kv, "map50"),
+                         map5095=map_num(kv, "map5095")))
     return rows
 ''')
 
@@ -749,8 +771,16 @@ if HAS_FREE_TIME:
     # merged — the one error the whole free-time method exists to prevent, and
     # it makes free time read far too low with nothing else looking wrong.
     for (run, scope), grp in df_ftg[df_ftg.line_kind == "kind"].groupby(["run", "scope"]):
-        merged = df_ftd[(df_ftd.run == run) & (df_ftd.cluster == scope)].busy_s.sum()
-        ratio = grp.busy_s.sum() / merged if merged else float("nan")
+        # System spans every device in the run: no DEVICE row carries
+        # cluster="System", so matching on the cluster leaves the denominator at
+        # 0 and prints "nanx ... SUMMED, NOT MERGED" — a false alarm on the one
+        # scope that covers the whole fleet.
+        of_run = df_ftd[df_ftd.run == run]
+        merged = (of_run if scope == "System" else of_run[of_run.cluster == scope]).busy_s.sum()
+        if not merged:
+            print(f"free time: {scope} has no device busy total to check per-kind against")
+            continue
+        ratio = grp.busy_s.sum() / merged
         print(f"free time: {scope} per-kind sum is {ratio:.2f}x the merged busy  "
               f"({'OK — merged' if ratio > 1.001 else 'SUMMED, NOT MERGED'})")
 
@@ -1391,8 +1421,20 @@ else:
         col = "reason" if src is reasons else "kind"
         names = sorted(src[col].dropna().unique(),
                        key=lambda v: -src[src[col] == v].share.sum())
+        # guide/06 §2: a 9th series is never a generated hue — fold it into
+        # "Other". This run reports NINE busy kinds, and `SLOTS[i % 8]` handed
+        # the ninth slot 0's blue, so `metrics` and `inference` came out the
+        # same colour in one legend. The tail is folded, not cycled, and the
+        # names are already ordered by share so the tail is the small ones.
+        if len(names) > len(SLOTS):
+            tail = set(names[len(SLOTS) - 1:])
+            src = src.assign(**{col: src[col].where(~src[col].isin(tail), "Other")})
+            names = names[:len(SLOTS) - 1] + ["Other"]
         # Colour follows the ENTITY, bound once, so filtering never repaints it.
-        colour_of = {name: SLOTS[i % len(SLOTS)] for i, name in enumerate(names)}
+        # "Other" is an aggregate rather than an entity, so it takes the muted
+        # chrome grey instead of a categorical slot.
+        colour_of = {name: (MUTED if name == "Other" else SLOTS[i])
+                     for i, name in enumerate(names)}
         x, width = np.arange(len(scopes)), 0.8 / max(len(names), 1)
         for i, name in enumerate(names):
             vals = [float(src[(src.scope == s) & (src[col] == name)].share.sum())
@@ -1401,13 +1443,18 @@ else:
                        label=name, color=colour_of[name], **BAR_KW)
             label_bars(ax, b, fmt="{:.0f}", fontsize=8)
         ax.set_xticks(x, scopes)
-        # pad=34 clears the legend row: legend_above anchors the legend's BOTTOM
-        # to the axes top, and a default-pad title lands straight on top of it.
-        ax.set_title(title, pad=34)
+        # legend_above anchors the legend's BOTTOM to the axes top, so the title
+        # must clear the WHOLE legend block. A fixed pad clears one row; the two
+        # panels here carry different numbers of series, and the busy panel's
+        # three rows were drawn straight through its own title. Scale the pad by
+        # the row count instead.
+        ncol = min(len(names), 4)
+        rows = -(-len(names) // ncol)          # ceil: legend rows this panel needs
+        ax.set_title(title, pad=17 * (rows + 1))
         ax.set_ylabel(ylab)
         ax.grid(axis="x", visible=False)
         ax.set_ylim(0, max(105, ax.get_ylim()[1] * 1.12))
-        legend_above(ax, ncol=min(len(names), 4), side="center")
+        legend_above(ax, ncol=ncol, side="center")
 
     fig.suptitle("Free-time attribution and busy breakdown", fontsize=14,
                  fontweight="semibold", color=INK, y=1.10)
@@ -1661,7 +1708,15 @@ way `e2e` latency is labelled indicative rather than exact.
 """)
 code(r'''
 if not HAS_MAP:
-    print("map.log absent or empty — 15 skipped (needs map.enabled and ground truth).")
+    # "Absent" and "present but unreadable" are different failures and must not
+    # print the same sentence: the first is a run without accuracy, the second is
+    # a format the parser above does not cover, and only one of them is a bug.
+    raw = sum(len(read_lines(d / "map.log")) for d in RUNS.values())
+    print("map.log absent or empty — 15 skipped (needs map.enabled and ground truth)."
+          if not raw else
+          f"map.log holds {raw} line(s) but none carried a readable mAP — 15 skipped. "
+          f"A present file that charts nothing is a FORMAT MISMATCH, not a run "
+          f"without accuracy; extend MAP_KEYS in the parser cell.")
 else:
     run = RUN_ORDER[0] if RUN_ORDER else None
     window = (df_mapw[df_mapw.run == run] if run else df_mapw)
@@ -1670,6 +1725,7 @@ else:
 
     fig, ax = plt.subplots(figsize=(12.4, 4.7))
     SERIES = [("map50", "mAP@50", S1), ("map5095", "mAP@50:95", S2)]
+    xcol = "t_offset_s"
     if len(window):
         # One line per metric, pooled across completing devices at each window
         # index: the question is "did accuracy move over the run", and one line
@@ -1678,9 +1734,13 @@ else:
                         .agg(t_offset_s=("t_offset_s", "mean"),
                              map50=("map50", "mean"), map5095=("map5095", "mean"))
                         .reset_index().sort_values("i"))
+        # A pre-rename file indexes windows and ships no offsets. Fall back to
+        # the index and SAY SO on the axis — a silent swap would put window
+        # numbers under a label that reads seconds.
+        xcol = "t_offset_s" if pooled.t_offset_s.notna().any() else "i"
         for col, lbl, colour in SERIES:
-            ax.plot(pooled.t_offset_s, pooled[col], color=colour, label=lbl, **LINE_KW)
-            endpoint(ax, pooled.t_offset_s.iloc[-1], float(pooled[col].iloc[-1]),
+            ax.plot(pooled[xcol], pooled[col], color=colour, label=lbl, **LINE_KW)
+            endpoint(ax, pooled[xcol].iloc[-1], float(pooled[col].iloc[-1]),
                      colour, fmt="{:.3f}")
         # Whole-run reference for each metric: same hue, thinner, receding.
         if len(system):
@@ -1692,16 +1752,21 @@ else:
     # do — autoscaling a 0.59-0.62 band to fill the panel turns ordinary window
     # noise into a dramatic collapse.
     ax.set_ylim(0, 1.0)
-    ax.set_xlabel("seconds since that device's own first scored frame")
+    ax.set_xlabel("seconds since that device's own first scored frame"
+                  if xcol == "t_offset_s" else "window index")
     ax.set_ylabel("mAP (0-1, higher is better)")
     ax.grid(axis="x", visible=False)
     legend_above(ax, ncol=2, side="right")
     ax.set_title("Detection accuracy over the run", pad=30)
     if len(system):
         s = system.iloc[0]
+        # An archive that carries neither the frame count nor the pooling label
+        # states what it has and omits what it does not. Printing `nan frames`
+        # or an unlabelled mean would both read as measurements.
+        scored = f" over {s.frames:,.0f} frames" if np.isfinite(s.frames) else ""
+        pooling = (s.pooling or "pooling unlabelled").replace("_", "-")
         subtitle(ax, f"whole run: mAP@50 {s.map50:.3f} · mAP@50:95 "
-                     f"{s.map5095:.3f} over {s.frames:,.0f} frames — "
-                     f"{s.pooling.replace('_', '-')} across "
+                     f"{s.map5095:.3f}{scored} — {pooling} across "
                      f"{len(summary[summary.scope != 'System'])} completing "
                      f"device(s), indicative rather than pooled")
     finish(fig, "15_map_over_run.png")
