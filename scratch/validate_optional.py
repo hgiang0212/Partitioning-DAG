@@ -83,24 +83,29 @@ def check_free_time(d, errs, warns, notes):
     notes.append(f"free time: {len(dev)} device(s) on {len(machines)} machine(s), "
                  f"busy+free == span on every one")
 
-    by_scope_free, reasons, kinds, all_lines = {}, {}, {}, 0
+    by_scope_free, reasons, kinds = {}, {}, {}
     for i, line in enumerate(group, 1):
         k, fl = kv(line), flags(line)
         scope = k.get("cluster") or ("SYSTEM" if "SYSTEM" in fl else None)
-        if "ALL" in fl and scope:
+        # FREE and KIND are BREAKDOWN lines, not scope totals (01 §3.9): they
+        # carry a reason's or a kind's slice of the scope and legitimately have
+        # neither `free` nor `free_mean`. Only the total line of a scope — the
+        # `ALL` line of a cluster, the bare `SYSTEM` line — owns the two ratios,
+        # so the rules below key off "total", never off the SYSTEM flag alone.
+        breakdown = bool({"FREE", "KIND"} & set(fl))
+        total = not breakdown and ("ALL" in fl or "SYSTEM" in fl)
+        if total and scope:
             by_scope_free[scope] = num(k.get("free_s"))
             if "free_mean" not in k:
-                errs.append(f"free_time_cluster.log:{i}: ALL lines must carry free_mean "
-                            f"beside free")
-            all_lines += 1
+                errs.append(f"free_time_cluster.log:{i}: {scope} total line must carry "
+                            f"free_mean beside free — a pooled figure hides one idle "
+                            f"device inside a busy scope, and the divergence is the signal")
         if "FREE" in fl:
             reasons.setdefault(scope, []).append((k.get("reason"), num(k.get("free_s")),
                                                   num(k.get("share"))))
         if "KIND" in fl:
             kinds.setdefault(scope, 0.0)
             kinds[scope] += num(k.get("busy_s"))
-        if "SYSTEM" in fl and "free_mean" not in k:
-            errs.append(f"free_time_cluster.log:{i}: SYSTEM line must carry free_mean")
 
     for scope, entries in reasons.items():
         share = sum(s for _, _, s in entries)
@@ -119,9 +124,11 @@ def check_free_time(d, errs, warns, notes):
 
     # The one that catches the error this whole method exists to prevent.
     for scope, kind_sum in kinds.items():
-        busy = next((num(kv(l).get("busy_s")) for l in dev), None)
+        # SYSTEM spans every device: no device line carries `cluster=SYSTEM`, so
+        # matching the scope against `cluster=` leaves the system total at 0 and
+        # silently skips the check on the ONE scope that covers the whole run.
         merged = sum(num(kv(l).get("busy_s")) for l in dev
-                     if kv(l).get("cluster") == scope)
+                     if scope == "SYSTEM" or kv(l).get("cluster") == scope)
         if merged and kind_sum <= merged + TOL:
             errs.append(f"free_time_cluster.log: per-kind busy for {scope} sums to "
                         f"{kind_sum:.3f}s, not MORE than the merged busy {merged:.3f}s "
@@ -195,8 +202,9 @@ def check_broker_ram(d, errs, warns, notes):
         errs.append("broker_ram.log: USED percentiles out of order "
                     "(min <= p50 <= p95 <= max required)")
     notes.append(f"broker RAM: {int(num(broker['samples']))} samples, "
-                 f"source={broker.get('source')}, phases {sorted(set(phases))}, "
-                 f"COMPARE present")
+                 f"source={broker.get('source')}, "
+                 f"phases {sorted(p for p in set(phases) if p)}, "
+                 f"COMPARE {'present' if 'COMPARE' in kinds else 'absent'}")
 
 
 def check_message_size(d, errs, warns, notes):
@@ -272,6 +280,19 @@ def check_map(d, errs, warns, notes):
         return
     if not summary:
         notes.append("accuracy: files present but empty (feature off this run)")
+        return
+
+    # An archive written before the rename spells these `mAP50=` / `mAP50_95=`
+    # — uppercase, which guide/01 §1 does not permit — and indexes windows with
+    # `window=` instead of `i=` plus offsets. That is ONE fact about the file,
+    # so say it once and stop: running the per-line checks over a key that is
+    # not there turns a rename into sixteen "outside [0, 1]" messages, every one
+    # of which names the wrong bug.
+    if any("mAP50" in line for line in summary + series):
+        errs.append("accuracy: map.log/map_window.log use the PRE-RENAME keys "
+                    "mAP50=/mAP50_95= (and window= with no t_offset_s=). The "
+                    "notebook parser reads both spellings so the archive still "
+                    "charts; this validator certifies the current format only")
         return
 
     sys_lines = [l for l in summary if "SYSTEM" in flags(l)]
