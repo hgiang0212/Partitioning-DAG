@@ -180,13 +180,21 @@ cython_debug/
 !results/**/*.log
 
 # Per-device scratch, not results (guide/05 §5): superseded by the pooled logs,
-# and a leftover copy silently poisons the next run's numbers.
+# and a leftover copy silently poisons the next run's numbers. Name the scratch
+# files EXACTLY: `message_size_*.log` also matched the archived
+# `results/<run>/message_size_series.log`, and a later rule beats the negation
+# above — so every pushed archive lost half of an all-or-none family (01 §2)
+# and the reader hard-failed on "emit both or neither".
 metrics_raw_*.csv
 metrics_pivoted*.csv
 metrics_pivot.lock
 timing_edge_*.log
 timing_cloud_*.log
-message_size_*.log
+message_size_local.log
+
+# Re-assert it last: an archived run is the deliverable, and no scratch rule
+# added below may clip a file out of one.
+!results/**/*.log
 
 # Fabricated run used to exercise the validators and the notebook before real
 # results exist (scratch/make_synthetic_run.py). Regenerable, and it must never
