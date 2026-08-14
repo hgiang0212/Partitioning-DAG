@@ -700,6 +700,26 @@ class Server:
                     / len(group)) if group else 0.0
             return free, span, (100.0 * free / span if span else 0.0), mean
 
+        def breakdown(scope, group, free, span):
+            """The `FREE reason=` and `KIND kind=` lines for ONE scope.
+
+            Emitted per cluster and again for the whole fleet. guide/10 §6 reads
+            `SYSTEM free=` first and the reasons third — "was the fleet starved
+            (`input`) or congested (`backpressure`)?" is a question about the
+            fleet, and without the SYSTEM-scoped pair it has to be re-derived by
+            hand from the per-cluster lines every time."""
+            out = []
+            for key, tag, field, total in (("reasons_ns", "FREE reason", "free_s", free),
+                                           ("kinds_ns", "KIND kind", "busy_s", span)):
+                totals = {}
+                for _, ft in group:
+                    for name, value in (ft.get(key) or {}).items():
+                        totals[name] = totals.get(name, 0) + value
+                for name, value in sorted(totals.items(), key=lambda nv: -nv[1]):
+                    out.append(f"{t_ns} {scope} {tag}={name} {field}={value / 1e9:.3f} "
+                               f"share={(100.0 * value / total if total else 0.0):.2f}%")
+            return out
+
         by_cluster, by_machine = {}, {}
         for report, ft in devices:
             _, _, machine, cluster, _ = self._ft_ident(report, ft)
@@ -721,25 +741,10 @@ class Server:
             # Reasons sum to EXACTLY the scope's free time: attribution is
             # priority-ordered on the device, so no moment is claimed twice, and
             # whatever no reason covers is reported as `unaccounted` rather than
-            # quietly dropped.
-            reasons = {}
-            for _, ft in group:
-                for reason, value in (ft.get("reasons_ns") or {}).items():
-                    reasons[reason] = reasons.get(reason, 0) + value
-            for reason, value in sorted(reasons.items(), key=lambda kv: -kv[1]):
-                lines.append(f"{t_ns} cluster={cluster} FREE reason={reason} "
-                             f"free_s={value / 1e9:.3f} "
-                             f"share={(100.0 * value / free if free else 0.0):.2f}%")
-            # KIND shares MAY sum to more than 100%: per-kind sums overlap across
-            # lanes by construction. Only the merged busy_s above is exclusive.
-            kinds = {}
-            for _, ft in group:
-                for kind, value in (ft.get("kinds_ns") or {}).items():
-                    kinds[kind] = kinds.get(kind, 0) + value
-            for kind, value in sorted(kinds.items(), key=lambda kv: -kv[1]):
-                lines.append(f"{t_ns} cluster={cluster} KIND kind={kind} "
-                             f"busy_s={value / 1e9:.3f} "
-                             f"share={(100.0 * value / span if span else 0.0):.2f}%")
+            # quietly dropped. KIND shares MAY sum to more than 100%: per-kind
+            # sums overlap across lanes by construction, and only the merged
+            # busy_s above is exclusive.
+            lines += breakdown(f"cluster={cluster}", group, free, span)
 
         # MACHINE lines come from the UNION of the busy intervals of the device
         # processes on that host, never from their ratios: two devices that are
@@ -763,12 +768,16 @@ class Server:
             lines.append(line)
 
         free, span, ratio, mean = pooled(devices)
-        lines.append(f"{t_ns} SYSTEM devices={len(devices)} clusters={len(by_cluster)} "
-                     f"machines={len(by_machine)} free={ratio:.2f}% free_mean={mean:.2f}% "
-                     f"free_s={free / 1e9:.3f} span_s={span / 1e9:.3f}")
+        system = (f"{t_ns} SYSTEM devices={len(devices)} clusters={len(by_cluster)} "
+                  f"machines={len(by_machine)} free={ratio:.2f}% free_mean={mean:.2f}% "
+                  f"free_s={free / 1e9:.3f} span_s={span / 1e9:.3f}")
+        lines.append(system)
+        lines += breakdown("SYSTEM", devices, free, span)
         with open(self.free_time_cluster_path, "w") as f:
             f.write("\n".join(lines) + "\n")
-        src.Log.print_with_color(f"[FreeTime] {lines[-1]}", "green")
+        # The TOTAL, not lines[-1]: the breakdown now follows it, and the console
+        # line is the one number a reader checks first (10 §6).
+        src.Log.print_with_color(f"[FreeTime] {system}", "green")
 
     def _write_free_time_series(self, t_ns, devices):
         """One line per device per bucket. The leading timestamp is the report's
