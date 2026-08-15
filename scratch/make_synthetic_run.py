@@ -113,7 +113,7 @@ def build_server(run_dir):
     server.util_log_path         = str(run_dir / "utilization.log")
     server.util_cluster_path       = str(run_dir / "utilization_cluster.log")
     server.latency_cluster_path    = str(run_dir / "latency_cluster.log")
-    server.events_path           = str(run_dir / "events_ns.log")
+    server.events_path           = str(run_dir / "cut_change_ns.log")
     server.free_time_path        = str(run_dir / "free_time.log")
     server.free_time_cluster_path  = str(run_dir / "free_time_cluster.log")
     server.free_time_series_path = str(run_dir / "free_time_series.log")

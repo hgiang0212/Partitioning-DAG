@@ -76,7 +76,7 @@ charts facet by run and 09 appears.
 | `utilization.log` | 08 |
 | `utilization_cluster.log` | 07, 09 |
 | `latency_cluster.log` | 05, 06, 09 |
-| `events_ns.log` | 02 (vertical rules) |
+| `cut_change_ns.log` | 02 (vertical rules) |
 | `free_time*.log` | 10, 11, 12 |
 | `broker_ram*.log` | 13, 14 (subtitle) |
 | `message_size*.log` | 14 |
@@ -410,7 +410,7 @@ def parse_util_device(run, path):                     # utilization.log
                          utilization=num(kv.get("utilization"))))
     return rows
 
-def parse_events(run, path):                          # events_ns.log
+def parse_events(run, path):                          # cut_change_ns.log
     rows = []
     for ln in read_lines(path):
         parts = ln.split(None, 1)                     # split ONCE: description has spaces
@@ -615,7 +615,7 @@ COLS = {
     "utg":   ["run", "scope", "role", "devices", "utilization",
               "utilization_mean", "busy_s", "total_s", "packages"],
     "utd":   ["run", "client", "role", "packages", "busy_s", "total_s", "utilization"],
-    "ev":    ["run", "ts", "description"],          # events_ns.log is optional (01 §2)
+    "ev":    ["run", "ts", "description"],          # cut_change_ns.log is optional (01 §2)
     # Optional families (files 8-14). Absent or empty -> a 0-row frame WITH
     # columns, so the charts below can filter it without raising.
     "ftd":   ["run", "client", "role", "machine", "cluster", "dev", "span_s",
@@ -650,7 +650,13 @@ def load_all():
         rows["lat"]   += parse_latency(run,       d / "latency_cluster.log")
         rows["utg"]   += parse_util_group(run,    d / "utilization_cluster.log")
         rows["utd"]   += parse_util_device(run,   d / "utilization.log")
-        rows["ev"]    += parse_events(run,        d / "events_ns.log")
+        # File 7 is `cut_change_ns.log` in this project's `cluster` scheme; the
+        # `group`-scheme spelling is accepted so archives written before the
+        # rename still chart (01 §2 naming note).
+        ev_path = d / "cut_change_ns.log"
+        if not ev_path.exists():
+            ev_path = d / "events_ns.log"
+        rows["ev"]    += parse_events(run,        ev_path)
         rows["ftd"]   += parse_free_time_device(run, d / "free_time.log")
         rows["ftg"]   += parse_free_time_cluster(run,  d / "free_time_cluster.log")
         rows["fts"]   += parse_free_time_series(run, d / "free_time_series.log")
@@ -852,7 +858,7 @@ md("""
 ## 02 · System throughput over the run
 
 `batch_done_ns.log` — the authoritative system-wide series — against **seconds
-into the run**, with `events_ns.log` overlaid as vertical rules. Both files are on
+into the run**, with `cut_change_ns.log` overlaid as vertical rules. Both files are on
 the server clock, which is the entire reason for the one-clock rule (01 §1).
 
 The raw reading is noisy, so a 31-reading centred mean carries the trend and the
@@ -1247,7 +1253,7 @@ finish(fig, "08_device_utilization.png")
 md("""
 ## 09 · Run comparison — verdict bar
 
-Only drawn when two runs are loaded. `events_ns.log` needs no chart of its own —
+Only drawn when two runs are loaded. `cut_change_ns.log` needs no chart of its own —
 its rules are overlaid on 02, where they can be read against the throughput they
 were supposed to change.
 
@@ -1819,7 +1825,7 @@ COVERAGE = {
     "utilization.log":         ("required", ["08"]),
     "utilization_cluster.log":   ("required", ["07", "09"]),
     "latency_cluster.log":       ("required", ["05", "06", "09"]),
-    "events_ns.log":           ("optional", ["02 (rules; nothing drawn if absent)"]),
+    "cut_change_ns.log":       ("optional", ["02 (rules; nothing drawn if absent)"]),
     "free_time.log":           ("optional", ["10", "12"]),
     "free_time_cluster.log":     ("optional", ["11"]),
     "free_time_series.log":    ("optional", ["12"]),

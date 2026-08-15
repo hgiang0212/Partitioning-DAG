@@ -79,7 +79,12 @@ class Server:
         self.util_log_path       = f"{log_path}/utilization.log"
         self.util_cluster_path    = f"{log_path}/utilization_cluster.log"
         self.latency_cluster_path = f"{log_path}/latency_cluster.log"
-        self.events_path        = f"{log_path}/events_ns.log"
+        # File 7 under the `cluster` scheme is `cut_change_ns.log` (01 §2 naming
+        # note). `events_ns.log` is the `group`-scheme spelling of the same file:
+        # emitting it here made this project's output a MIX of the two schemes,
+        # which 00 §4 calls out as the single most common reason a complete
+        # directory still reads as missing files.
+        self.events_path        = f"{log_path}/cut_change_ns.log"
         # Optional families, each all-its-files-or-none (01 §2):
         self.free_time_path        = f"{log_path}/free_time.log"          # 10
         self.free_time_cluster_path  = f"{log_path}/free_time_cluster.log"
@@ -97,16 +102,28 @@ class Server:
         # every other file reads these two as well.
         self.map_path              = f"{log_path}/map.log"
         self.map_window_path       = f"{log_path}/map_window.log"
-        self.result_files = [self.batch_log_path, self.fps_cluster_ns_path,
-                             self.fps_cluster_path, self.util_log_path,
-                             self.util_cluster_path, self.latency_cluster_path,
-                             self.events_path,
-                             self.free_time_path, self.free_time_cluster_path,
-                             self.free_time_series_path,
-                             self.broker_ram_ns_path, self.broker_ram_path,
-                             self.msg_size_path, self.msg_size_series_path,
-                             self.broker_guard_ns_path, self.broker_guard_path,
-                             self.map_path, self.map_window_path]
+        # Grouped by FEATURE, because that is the unit the archiver has to move
+        # (00 §5): a feature is all its files or none, so a group whose files are
+        # all empty is skipped whole and a group with any content is copied
+        # whole — empty members included. Archiving file-by-file on "size > 0"
+        # instead turns a fully-ported feature into a HALF-ported one the moment
+        # one of its two files legitimately has no rows, and that is a hard
+        # validator error on the archive while the live directory passes.
+        self.result_groups = {
+            "core":     [self.batch_log_path, self.fps_cluster_ns_path,
+                         self.fps_cluster_path, self.util_log_path,
+                         self.util_cluster_path, self.latency_cluster_path],
+            "events":   [self.events_path],
+            "freetime": [self.free_time_path, self.free_time_cluster_path,
+                         self.free_time_series_path],
+            "infraram": [self.broker_ram_ns_path, self.broker_ram_path],
+            "msgsize":  [self.msg_size_path, self.msg_size_series_path],
+            # Project files, outside the 14-file contract (00 §7). Grouped the
+            # same way so they cannot half-land either.
+            "guard":    [self.broker_guard_ns_path, self.broker_guard_path],
+            "map":      [self.map_path, self.map_window_path],
+        }
+        self.result_files = [p for paths in self.result_groups.values() for p in paths]
         # Truncate ALL of them UNCONDITIONALLY, once, centrally, before any
         # worker can write (01 §4) — including the optional ones, and including
         # the ones this run's flags turn off. Conditional truncation is how a
@@ -957,14 +974,25 @@ class Server:
                 dest = os.path.join(self._archive_root, f"{run_id}-{suffix}")
             os.makedirs(dest, exist_ok=True)
 
-            copied = []
-            for path in self.result_files:
-                # Skip empty files: a zero-length log must never be archived as
-                # a misleading result. Every file here was truncated at startup,
-                # so nothing non-empty can be a leftover from a previous run.
-                if os.path.exists(path) and os.path.getsize(path) > 0:
-                    shutil.copy2(path, os.path.join(dest, os.path.basename(path)))
-                    copied.append(os.path.basename(path))
+            copied, skipped = [], []
+            for group, paths in self.result_groups.items():
+                # A feature is all its files or none (00 §5). Skip the group
+                # only when NOTHING in it has rows — that is the honest "this
+                # run had none". If any member has content the whole group is
+                # copied, empty members included, because a reader treats a
+                # missing file as a hard error and an empty one as a valid
+                # answer, and dropping one file of a pair reads as a half-port.
+                # Every file here was truncated at startup, so nothing non-empty
+                # can be a leftover from a previous run.
+                live = [p for p in paths
+                        if os.path.exists(p) and os.path.getsize(p) > 0]
+                if not live:
+                    skipped.append(group)
+                    continue
+                for path in paths:
+                    if os.path.exists(path):
+                        shutil.copy2(path, os.path.join(dest, os.path.basename(path)))
+                        copied.append(os.path.basename(path))
             if os.path.exists(self._config_path):
                 shutil.copy2(self._config_path, os.path.join(dest, "config.yaml"))
                 copied.append("config.yaml")
@@ -975,6 +1003,13 @@ class Server:
             else:
                 src.Log.print_with_color(
                     f"[Archive] {dest}  ({len(copied)} files: {', '.join(copied)})", "green")
+                # Name the features that produced nothing. "9 result file(s)" is
+                # only good news if you expected nine (05 §3), and the way to
+                # check that is against the list of what was left out.
+                if skipped:
+                    src.Log.print_with_color(
+                        f"[Archive] no rows, skipped whole: {', '.join(sorted(skipped))}",
+                        "yellow")
         except Exception as e:
             src.Log.print_with_color(f"[Archive] failed: {e}", "yellow")
 
