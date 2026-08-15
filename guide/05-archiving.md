@@ -7,24 +7,45 @@ A results directory describes exactly one run ([01 §4](01-result-format.md)) an
 
 ## 1 · Layout
 
+An archived run holds **the same fourteen files as the live directory**
+([00](00-file-inventory.md)), minus whichever optional features were off, **plus the
+config**. Anything absent should be absent for a reason you can name.
+
 ```
 results/
 ├── <run-id>/
-│   ├── batch_done_ns.log
-│   ├── group_rate_ns.log
-│   ├── group_rate.log
-│   ├── utilization.log
-│   ├── utilization_group.log
-│   ├── latency_group.log
-│   ├── events_ns.log          (only if the feature that writes it ran)
-│   ├── broker_ram_ns.log      (only if the infra-host sampler ran — 11)
-│   ├── broker_ram.log         (only if the infra-host sampler ran — 11)
-│   ├── message_size.log       (only if a worker measured payload size — 12)
-│   ├── message_size_series.log (only if a worker measured payload size — 12)
-│   └── config.yaml            THE CONFIG THAT PRODUCED THESE NUMBERS
+│   ├── batch_done_ns.log            ┐
+│   ├── group_rate_ns.log            │
+│   ├── group_rate.log               ├ the six required files — always all six
+│   ├── utilization.log              │
+│   ├── utilization_group.log        │
+│   ├── latency_group.log            ┘
+│   ├── events_ns.log                 (only if a control plane ran — 01 §3.7)
+│   ├── free_time.log                ┐
+│   ├── free_time_group.log          ├ only if free time was on — 10
+│   ├── free_time_series.log         ┘
+│   ├── broker_ram_ns.log            ┐ only if the infra-host sampler ran — 11
+│   ├── broker_ram.log               ┘
+│   ├── message_size.log             ┐ only if a worker measured payload size — 12
+│   ├── message_size_series.log      ┘
+│   ├── config.yaml                   THE CONFIG THAT PRODUCED THESE NUMBERS
+│   ├── metrics_raw/                  per-unit CSVs, from devices sharing this filesystem
+│   └── free_time_devices/            per-device free-time logs, same best-effort rule
 └── visual/
     └── <Name> Visualization.ipynb
 ```
+
+The last two directories are **side-cars**, not results
+([00 §6](00-file-inventory.md)). They are best-effort: only devices that share the
+server's filesystem contribute, and the roll-ups above already carry every device's
+numbers either way. Their value is that they are the **only** per-unit record — of payload
+size, split point and latency together, and of each device's per-lane, per-bucket idle
+breakdown. Diagnosing a shared bottleneck usually needs exactly one of them. Warn when
+they are absent; never fail.
+
+Project-specific outputs (model accuracy, the pipeline's own results) may be archived
+alongside, but they are outside this contract and must never stand in for a missing result
+file ([00 §7](00-file-inventory.md)).
 
 Run id: `results_<MMDD>_<HHMM>_<tag>`, or `<date>/<variant>` when you are comparing a
 small fixed set of configurations. Both appear in the reference project:
@@ -62,6 +83,11 @@ way that matters, the difference belongs in `config.yaml` — which is why it is
   its connections and exits cleanly.
 - **Warn on an empty archive.** If every log was missing or empty, say so loudly — that
   is a run that produced nothing, and it should not look like a success.
+- **Print what was copied, and check it against the inventory.** `"[Archive] 9 result
+  file(s) -> …"` is only good news if you expected nine. Run
+  `python guide/validate_results.py <archive-dir>` on the archive, not only on the live
+  directory — its inventory pass names every file the run should have produced
+  ([00 §9](00-file-inventory.md)), and an archive is what you will still have in a month.
 
 ---
 
@@ -89,14 +115,23 @@ Do not rely on mtime. It is close enough to fool you and wrong often enough to m
 
 ## 5 · Files that are *not* results
 
-Some artifacts are scratch space or per-device output, not run results. Keep them out of
-the archive, and clear them at startup so leftovers cannot poison the next run:
+Some artifacts are scratch space or per-device output, not run results
+([00 §6](00-file-inventory.md) is the full list). Keep them out of the *result* inventory,
+clear them at startup so leftovers cannot poison the next run, and archive the useful ones
+into their own subdirectory where they cannot be mistaken for results:
 
-| Artifact | Written by | Why it is not a result |
-|---|---|---|
-| per-device raw metric CSVs | each device | superseded by the pooled logs; huge |
-| streamed output records | the producing stage | data, not measurement |
-| any write-once cache directory | workers | **leftovers "win" forever and silently poison every future run** |
+| Artifact | Written by | Why it is not a result | Archive it? |
+|---|---|---|---|
+| per-device raw metric CSVs | each device | superseded by the pooled logs; huge | yes, under `metrics_raw/` — the only per-unit record |
+| per-device free-time logs | each device | the roll-ups already carry the numbers | yes, under `free_time_devices/` |
+| per-device timing logs | each device | raw input to utilization, already reduced | no |
+| streamed output records | the producing stage | data, not measurement | no |
+| any write-once cache directory | workers | **leftovers "win" forever and silently poison every future run** | no — **delete** at startup |
+
+Device ids are new every run, so a device that ran on this filesystem last time leaves a
+file that belongs to nothing this time. Delete side-cars by glob at startup, in the
+component that starts **once**, or the archiver folds last run's files into this run's
+results and nothing in the output says so.
 
 That last one is the dangerous case. A write-once cache keyed by item id, not cleared
 between runs, means run N+1 silently reuses run N's outputs for every key they share.

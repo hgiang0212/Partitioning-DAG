@@ -533,4 +533,12 @@ Before shipping, confirm every required file feeds at least one chart:
 | `latency_group.log` | C5, C6, C10 |
 | `events_ns.log` | C9 (skip if absent) |
 
+That is 7 of the 14 files in the inventory ([00](00-file-inventory.md)). The other seven —
+free time (8–10), infrastructure-host RAM (11–12) and message size (13–14) — have **no
+catalogued chart**. They are read as numbers, by the procedures in
+[10 §5](10-free-time.md), [11 §7](11-broker-ram.md) and [12 §5](12-message-size.md), and
+they exist to explain a curve the seven above already drew. If you chart them, they are
+your project's charts, not catalogue entries — so hold them to
+[06](06-visualization.md) and do not renumber C1–C11 around them.
+
 If a required file feeds nothing, either chart it or state in the notebook why not.

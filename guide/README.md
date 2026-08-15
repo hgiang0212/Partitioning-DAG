@@ -20,31 +20,41 @@ every other project's — same filenames, same line formats, same charts, same c
 
 ## The contract, in one paragraph
 
-A run produces **six required plain-text log files** in one directory (plus optional
-ones). Every line begins with a
-nanosecond-epoch timestamp taken on the **server's** clock, followed by `key=value`
-pairs. Every file is truncated at run start. Conform to
-[01-result-format.md](01-result-format.md) and the notebook in
+A run produces **14 plain-text log files** in one directory — **6 required** and **8
+optional**, the optional ones in **4 all-or-none feature groups** — plus the `config.yaml`
+that produced them. Every line begins with a nanosecond-epoch timestamp taken on the
+**server's** clock, followed by `key=value` pairs. Every file is truncated at run start.
+Conform to [01-result-format.md](01-result-format.md) and the notebook in
 [08-build-pipeline.md](08-build-pipeline.md) renders your results with **zero changes** —
 that is the entire point of fixing the format.
 
 ```
-<run-dir>/
-├── batch_done_ns.log         system throughput series      one line per completed unit
-├── group_rate_ns.log         per-group throughput series   one line per completed unit
-├── group_rate.log            throughput summary            one line per group + SYSTEM
-├── utilization.log           per-device busy ratio         one line per device
-├── utilization_group.log     utilization rolled up         per group, per group/role, SYSTEM
-├── latency_group.log         latency distributions         per group/role + per group + SYSTEM
-├── events_ns.log             control-plane events          one line per event (optional)
-├── free_time.log             per-device idle time          one line per device (optional)
-├── free_time_group.log       free time rolled up           per group, per machine, SYSTEM (optional)
-├── free_time_series.log      free time over the run        one line per device per bucket (optional)
-├── broker_ram_ns.log         infra-host RAM over the run   one line per sample (optional)
-├── broker_ram.log            infra-host RAM summary        BROKER/USED/DELTA lines (optional)
-├── message_size.log          payload size summary          one line per measured worker (optional)
-└── message_size_series.log   payload size over the run     one line per published message (optional)
+<run-dir>/                    ── measures ──────────────── one line is ──────────────
+├── batch_done_ns.log         when every unit finished     one completed unit          REQUIRED
+├── group_rate_ns.log         the same, split by group     one completed unit          REQUIRED
+├── group_rate.log            how fast the run was         one group + SYSTEM          REQUIRED
+├── utilization.log           what fraction each device    one device                  REQUIRED
+│                             spent busy
+├── utilization_group.log     the same, rolled up          group, group/role, SYSTEM   REQUIRED
+├── latency_group.log         how long a unit takes,       one (group, role, kind)     REQUIRED
+│                             and where the time goes
+├── events_ns.log             when control decisions       one control event           optional
+│                             changed something
+├── free_time.log             wall clock each device       one device                  optional ┐
+│                             spent doing nothing                                               │
+├── free_time_group.log       the same, rolled up + why    group/role/machine/reason   optional ├ one
+├── free_time_series.log      when each device was idle    one device × time bucket    optional ┘ feature
+├── broker_ram_ns.log         infra-host RAM over the run  one sample                  optional ┐ one
+├── broker_ram.log            what the run cost that host  BROKER/USED/DELTA/PHASE     optional ┘ feature
+├── message_size.log          bytes a worker puts on       one measured worker         optional ┐ one
+│                             the wire                                                          │ feature
+├── message_size_series.log   payload size over the run    one published message       optional ┘
+└── config.yaml               the settings behind every number above
 ```
+
+**Every file, in full detail — what it measures, who writes it, when, what breaks
+without it, and why a port ends up missing some — is
+[00-file-inventory.md](00-file-inventory.md). Read it first.**
 
 ---
 
@@ -53,6 +63,8 @@ that is the entire point of fixing the format.
 | # | File | Read it when |
 |---|---|---|
 | — | **this file** | first, always |
+| 00 | [file-inventory.md](00-file-inventory.md) | **second, always.** Which files must exist, what each measures, and why a port ends up missing some |
+| — | [PORT-PROMPT.md](PORT-PROMPT.md) | handing this port to an agent — two ready prompts, with and without accuracy metrics |
 | 01 | [result-format.md](01-result-format.md) | **normative.** Implementing or validating the output format |
 | 02 | [throughput.md](02-throughput.md) | implementing the throughput measurement |
 | 03 | [utilization.md](03-utilization.md) | implementing per-device utilization |
@@ -66,8 +78,11 @@ that is the entire point of fixing the format.
 | 11 | [broker-ram.md](11-broker-ram.md) | measuring an infrastructure host you run no code on (optional) |
 | 12 | [message-size.md](12-message-size.md) | measuring the bytes a worker puts on the wire (optional) |
 
-**If you are producing results:** 01 → 02 → 03 → 04 → 05 → 09.
-**If you are visualizing existing results:** 01 → 06 → 07 → 08 → 09.
+**If you are producing results:** 00 → 01 → 02 → 03 → 04 → 05 → 09.
+**If you are visualizing existing results:** 00 → 01 → 06 → 07 → 08 → 09.
+**If you are porting to a new project and files keep coming up missing:** the closing
+table of [00](00-file-inventory.md) diagnoses that specifically; [00 §8](00-file-inventory.md)
+is the manifest to tick off and [00 §10](00-file-inventory.md) the order to build them in.
 **If you are doing both:** in order.
 
 ---

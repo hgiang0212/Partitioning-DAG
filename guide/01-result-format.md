@@ -45,32 +45,37 @@ This grammar is why one 12-line parser reads every file
 
 ## 2 · File inventory
 
-Six required files plus four optional ones. All in one directory. All truncated at run
-start.
+**Fourteen files: six required, eight optional.** All in one directory. All truncated at
+run start. [00-file-inventory.md](00-file-inventory.md) is the long form of this table —
+per file, what it measures, what breaks without it, and why a port ends up missing some.
 
-| # | File | Written | Granularity | Required |
-|---|---|---|---|---|
-| 1 | `batch_done_ns.log` | live | one line per completed unit | **MUST** |
-| 2 | `group_rate_ns.log` | live | one line per completed unit, group-tagged | **MUST** |
-| 3 | `group_rate.log` | shutdown | one line per group + `SYSTEM` | **MUST** |
-| 4 | `utilization.log` | shutdown | one line per device | **MUST** |
-| 5 | `utilization_group.log` | shutdown | per group, per group/role, + `SYSTEM` | **MUST** |
-| 6 | `latency_group.log` | shutdown | per group/role, per group, + `SYSTEM` | **MUST** |
-| 7 | `events_ns.log` | live | one line per control event | **MAY** |
-| 8 | `free_time.log` | shutdown | one line per device | **MAY** |
-| 9 | `free_time_group.log` | shutdown | per group, per group/role, per machine, + `SYSTEM` | **MAY** |
-| 10 | `free_time_series.log` | shutdown | one line per device per time bucket | **MAY** |
-| 11 | `broker_ram_ns.log` | live | one line per RAM sample of the queue host | **MAY** |
-| 12 | `broker_ram.log` | shutdown | `BROKER` / `USED` / `DELTA` / `RABBIT`, then `PHASE` per phase + `COMPARE` | **MAY** |
-| 13 | `message_size.log` | shutdown | one line per measured worker | **MAY** |
-| 14 | `message_size_series.log` | shutdown | one line per published message | **MAY** |
+| # | File | Measures | Written | Granularity | Required |
+|---|---|---|---|---|---|
+| 1 | `batch_done_ns.log` | **when** every unit finished, system-wide | live | one line per completed unit | **MUST** |
+| 2 | `group_rate_ns.log` | the same arrivals, **split by group** | live | one line per completed unit, group-tagged | **MUST** |
+| 3 | `group_rate.log` | **how fast** the run was | shutdown | one line per group + `SYSTEM` | **MUST** |
+| 4 | `utilization.log` | what fraction of its run each device was **busy** | shutdown | one line per device | **MUST** |
+| 5 | `utilization_group.log` | the same ratio **rolled up**, pooled and mean | shutdown | per group, per group/role, + `SYSTEM` | **MUST** |
+| 6 | `latency_group.log` | **how long** a unit takes, and where the time goes | shutdown | per group/role, per group, + `SYSTEM` | **MUST** |
+| 7 | `events_ns.log` | **when** the control plane changed something | live | one line per control event | **MAY** |
+| 8 | `free_time.log` | wall clock each device spent **doing nothing** | shutdown | one line per device | **MAY** |
+| 9 | `free_time_group.log` | free time rolled up, **and why** | shutdown | per group, per group/role, per machine, + `SYSTEM` | **MAY** |
+| 10 | `free_time_series.log` | **when** each device was idle | shutdown | one line per device per time bucket | **MAY** |
+| 11 | `broker_ram_ns.log` | the infra host's **memory over the run** | live | one line per RAM sample of the queue host | **MAY** |
+| 12 | `broker_ram.log` | what running the system **cost** that host | shutdown | `BROKER` / `USED` / `DELTA` / `RABBIT`, then `PHASE` per phase + `COMPARE` | **MAY** |
+| 13 | `message_size.log` | **bytes** a worker puts on the wire | shutdown | one line per measured worker | **MAY** |
+| 14 | `message_size_series.log` | payload size **over the run** | shutdown | one line per published message | **MAY** |
 
-Files 13–14 are one feature — emit both or neither. They measure the **size of the
+The optional files come in **four all-or-none feature groups**: `7` alone, `8–10`,
+`11–12`, `13–14`. A group is emitted whole or not at all — half a feature is a summary
+whose samples cannot be checked, or samples with no summary to read them by.
+
+Files 13–14 measure the **size of the
 payload one worker puts on the wire**, recorded before each publish. Exactly one worker
 measures it — the first to register at the first stage, chosen by the server and told via
 the dispatch message. See [12-message-size.md](12-message-size.md).
 
-Files 11–12 are one feature — emit both or neither. They measure the **RAM of the
+Files 11–12 measure the **RAM of the
 machine hosting the message queue**, sampled by the server (nothing of ours runs on that
 machine, so it is pulled from outside over SSH). Every line carries `source=`: `ssh` means
 host memory from `/proc/meminfo`, `rabbitmq_api` means the management-API fallback, where
@@ -82,19 +87,29 @@ at rest as well as under load. Every sample carries `phase=` (`idle` / `run` / `
 the summary reports each phase plus a `COMPARE` line stating what running the system cost
 that host. See [11-broker-ram.md §6](11-broker-ram.md).
 
-Files 8–10 are one feature — emit all three or none. They measure **free time**: the
+Files 8–10 measure **free time**: the
 wall clock in which a device did no work of any kind. See
 [10-free-time.md](10-free-time.md) for the method and for why free time is neither
 utilization nor `1 − utilization`.
 
 > **Naming note.** The reference implementation names files 2, 3, 5, 6, 9
 > `fps_cluster_ns.log`, `fps_cluster.log`, `utilization_cluster.log`,
-> `latency_cluster.log`, `free_time_cluster.log`. Either name set is conformant — pick one **per project** and
-> keep it stable. The parsers in [08](08-build-pipeline.md) take the filename as a
-> parameter. Do not mix the two naming schemes within one project.
+> `latency_cluster.log`, `free_time_cluster.log`, and file 7 `cut_change_ns.log`. Either
+> name set is conformant — pick one **per project** and keep it stable. The parsers in
+> [08](08-build-pipeline.md) and the validator in §5 take the scheme as a parameter. Do
+> not mix the two naming schemes within one project: a directory that mixes them is
+> complete and still reads as five missing files. Full cross-reference:
+> [00 §4](00-file-inventory.md).
 
 Files MUST be created even when empty. A missing file is a hard error for the reader; an
 empty one is a valid "this run had none".
+
+**Not in this inventory, and not results.** Device-side side-car files (each device's own
+timing log, its live free-time and message-size records, per-unit metric CSVs) are inputs
+to the files above, not outputs of the run — but they have their own startup and archive
+rules, and a port that ignores them loses the only per-device record it will ever have.
+Project-specific outputs (model accuracy, the pipeline's actual results) are outside this
+contract entirely. Both are covered in [00 §6–§7](00-file-inventory.md).
 
 ---
 
@@ -526,169 +541,46 @@ archive     copy everything + the config that produced it  (05)
 
 ## 5 · Conformance validator
 
-Save as `guide/validate_results.py`. It checks the grammar and the cross-file invariants
-that catch real measurement bugs.
+The validator ships beside this file as **`guide/validate_results.py`** — a single
+dependency-free script, ~300 lines. It is the executable form of this specification, so
+it is the copy to read; do not maintain a second one inline here, or the two drift and
+the prose wins arguments it should lose.
 
-```python
-"""Validate a results directory against guide/01-result-format.md.
+It runs in two passes.
 
-usage: python validate_results.py <run-dir> [--names cluster|group]
-"""
-import re, sys
-from pathlib import Path
+**Pass 1 — inventory** ([00](00-file-inventory.md)). Before parsing a single line it
+reports all fourteen files as `ok` / `EMPTY` / `MISS`, prints an `N/14 present, M/6
+required` tally, and fails on:
 
-TS   = re.compile(r"^\d{19}(\s|$)")
-KV   = re.compile(r"(\w+)=([^\s]+)")
-PCT  = re.compile(r"^\d+(\.\d+)?%$")
+| Check | Why it exists |
+|---|---|
+| a required file is missing or empty | the six are the contract; six of six or the run is not conformant |
+| an optional feature is half-present | files 8–10, 11–12 and 13–14 are one feature each ([§2](#2--file-inventory)) |
+| `config.yaml` is not beside the results | warning only — but the numbers are unreadable in a month without it ([05](05-archiving.md)) |
 
-NAMES = {
-    "group":   dict(rate_ns="group_rate_ns.log", rate="group_rate.log",
-                    util_g="utilization_group.log", lat="latency_group.log"),
-    "cluster": dict(rate_ns="fps_cluster_ns.log", rate="fps_cluster.log",
-                    util_g="utilization_cluster.log", lat="latency_cluster.log"),
-}
+It accepts either naming scheme, and either name for file 7, so a conformant project is
+never reported as missing files it simply calls something else.
 
-def lines(p):
-    if not p.exists():
-        return None
-    return [l.rstrip("\n") for l in p.read_text(encoding="utf-8",
-                                                errors="ignore").splitlines() if l.strip()]
+**Pass 2 — grammar and cross-file invariants:**
 
-def num(v):
-    return float(str(v).rstrip("%"))
+| Check | Catches |
+|---|---|
+| every line opens with a 19-digit ns timestamp | a device clock, a float, or a header line leaking into a result file |
+| `batch_done_ns.log` has 1 or 2 columns, col 2 a float | the warm-up arity handled wrong — the most common parsing bug |
+| line counts match across files 1 and 2 | a stage that stopped reporting mid-run |
+| live timestamps are non-decreasing | out-of-order appends, or two writers on one file |
+| exactly one `SYSTEM` line, without `steady_fps` | a summary written per group instead of per run |
+| group `done` / `frames` sum **exactly** to `SYSTEM` | two stages both publishing completions — a 2× rate error |
+| `SYSTEM` span == max group span | a per-group START used where a shared one was required |
+| group `fps` never sums **below** `SYSTEM` | the same bug from the other direction |
+| `share` sums to ~100% | warning: units bucketed as `unknown` |
+| percentages carry `%` and never exceed 100% | overlapping busy intervals summed instead of merged |
+| `ALL` / `SYSTEM` carry `utilization_mean` beside `utilization` | a pooled figure hiding one idle device inside a busy group |
+| latency lines carry `n`/`mean`/`p50`/`p95`/`max`, ordered, `e2e` without `role` | percentiles computed on pre-averaged data |
+| `busy_s + free_s == span_s`, `free` ≤ 100% | free time summed across lanes instead of unioned |
+| `FREE reason=` shares total 100% per scope | free time silently dropped instead of reported as `unaccounted` |
 
-def main(run_dir, scheme):
-    d, N = Path(run_dir), NAMES[scheme]
-    errs, warns = [], []
-
-    required = ["batch_done_ns.log", N["rate_ns"], N["rate"],
-                "utilization.log", N["util_g"], N["lat"]]
-    files = {}
-    for name in required:
-        ls = lines(d / name)
-        if ls is None:
-            errs.append(f"{name}: MISSING (required)")
-        files[name] = ls or []
-
-    # -- grammar: every line starts with a 19-digit ns timestamp -------------
-    for name, ls in files.items():
-        for i, ln in enumerate(ls, 1):
-            if not TS.match(ln):
-                errs.append(f"{name}:{i}: does not start with a 19-digit ns timestamp")
-                break
-
-    # -- batch_done_ns.log: 1 or 2 columns, col2 parses as float -------------
-    bd = files["batch_done_ns.log"]
-    for i, ln in enumerate(bd, 1):
-        parts = ln.split()
-        if len(parts) not in (1, 2):
-            errs.append(f"batch_done_ns.log:{i}: expected 1 or 2 columns, got {len(parts)}")
-        elif len(parts) == 2:
-            try:
-                float(parts[1])
-            except ValueError:
-                errs.append(f"batch_done_ns.log:{i}: column 2 is not a float: {parts[1]!r}")
-
-    # -- cross-file: one group_rate_ns line per batch_done line -------------
-    if bd and files[N["rate_ns"]] and len(bd) != len(files[N["rate_ns"]]):
-        errs.append(f"line-count mismatch: batch_done_ns.log has {len(bd)}, "
-                    f"{N['rate_ns']} has {len(files[N['rate_ns']])} "
-                    f"(every completion must appear in both)")
-
-    # -- timestamps monotonic in the live series ---------------------------
-    for name in ("batch_done_ns.log", N["rate_ns"]):
-        ts = [int(l.split()[0]) for l in files[name]]
-        if any(b < a for a, b in zip(ts, ts[1:])):
-            errs.append(f"{name}: timestamps are not monotonically non-decreasing")
-
-    # -- group_rate.log: exactly one SYSTEM line; groups sum to it ----------
-    rate = files[N["rate"]]
-    sys_l = [l for l in rate if "SYSTEM" in l.split()]
-    grp_l = [l for l in rate if "cluster=" in l or "group=" in l]
-    if len(sys_l) != 1:
-        errs.append(f"{N['rate']}: expected exactly 1 SYSTEM line, found {len(sys_l)}")
-    else:
-        sk = dict(KV.findall(sys_l[0]))
-        if "steady_fps" in sk:
-            errs.append(f"{N['rate']}: SYSTEM line must not carry steady_fps")
-        gk = [dict(KV.findall(l)) for l in grp_l]
-        if gk:
-            # done/frames ARE additive.
-            for key in ("done", "frames"):
-                got, want = sum(num(k[key]) for k in gk), num(sk[key])
-                if got != want:
-                    errs.append(f"{N['rate']}: group {key} sums to {got:.0f}, "
-                                f"SYSTEM says {want:.0f}")
-            # fps is NOT additive (each scope divides by its own span). The exact
-            # invariant is on the spans: SYSTEM span == max(group span).
-            sys_span = num(sk["frames"]) / num(sk["fps"])
-            spans    = [num(k["frames"]) / num(k["fps"]) for k in gk]
-            if abs(max(spans) - sys_span) / sys_span > 0.01:
-                errs.append(f"{N['rate']}: SYSTEM span {sys_span:.2f}s != max group span "
-                            f"{max(spans):.2f}s (START is not shared, or SYSTEM does not "
-                            f"end at the overall last completion)")
-            if sum(num(k["fps"]) for k in gk) < num(sk["fps"]) * 0.99:
-                errs.append(f"{N['rate']}: group fps sums BELOW SYSTEM fps, which is "
-                            f"impossible with a shared START")
-            share = sum(num(k["share"]) for k in gk if "share" in k)
-            if any("share" in k for k in gk) and abs(share - 100.0) > 0.5:
-                warns.append(f"{N['rate']}: share sums to {share:.1f}%, expected ~100%")
-
-    # -- utilization: percent-formatted, and never above 100% --------------
-    for name in ("utilization.log", N["util_g"]):
-        for i, ln in enumerate(files[name], 1):
-            kv = dict(KV.findall(ln))
-            for key in ("utilization", "utilization_mean"):
-                if key in kv:
-                    if not PCT.match(kv[key]):
-                        errs.append(f"{name}:{i}: {key} must be percent-formatted "
-                                    f"with a trailing '%', got {kv[key]!r}")
-                    elif num(kv[key]) > 100.0:
-                        errs.append(f"{name}:{i}: {key}={kv[key]} exceeds 100% "
-                                    f"(overlapping busy intervals were summed)")
-
-    # -- utilization_group ALL/SYSTEM lines carry both ratios ---------------
-    for i, ln in enumerate(files[N["util_g"]], 1):
-        flags = [p for p in ln.split()[1:] if "=" not in p and p.isupper()]
-        if ("ALL" in flags or "SYSTEM" in flags):
-            kv = dict(KV.findall(ln))
-            if "utilization_mean" not in kv:
-                errs.append(f"{N['util_g']}:{i}: ALL/SYSTEM lines must carry "
-                            f"utilization_mean beside utilization")
-
-    # -- latency: required stat keys, ordering, e2e has no role -------------
-    for i, ln in enumerate(files[N["lat"]], 1):
-        kv = dict(KV.findall(ln))
-        if "kind" not in kv:
-            errs.append(f"{N['lat']}:{i}: missing kind=")
-            continue
-        missing = [k for k in ("n", "mean_ms", "p50_ms", "p95_ms", "max_ms") if k not in kv]
-        if missing:
-            errs.append(f"{N['lat']}:{i}: missing {', '.join(missing)}")
-            continue
-        if not (num(kv["p50_ms"]) <= num(kv["p95_ms"]) <= num(kv["max_ms"])):
-            errs.append(f"{N['lat']}:{i}: percentiles out of order "
-                        f"(p50 <= p95 <= max required)")
-        if kv["kind"] == "e2e" and "role" in kv:
-            errs.append(f"{N['lat']}:{i}: e2e lines must not carry role=")
-
-    print(f"\nvalidating {d}  (naming scheme: {scheme})")
-    for w in warns:
-        print(f"  [WARN] {w}")
-    for e in errs:
-        print(f"  [FAIL] {e}")
-    print(f"\n  -> {len(errs)} error(s), {len(warns)} warning(s): "
-          f"{'CONFORMANT' if not errs else 'NOT CONFORMANT'}\n")
-    return 1 if errs else 0
-
-if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        sys.exit("usage: python validate_results.py <run-dir> [--names cluster|group]")
-    scheme = "cluster"
-    if "--names" in sys.argv:
-        scheme = sys.argv[sys.argv.index("--names") + 1]
-    sys.exit(main(sys.argv[1], scheme))
-```
+Exit code is `0` when there are no errors, `1` otherwise, so it drops straight into CI.
 
 Run it on every run directory before charting:
 

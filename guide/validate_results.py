@@ -1,5 +1,9 @@
 """Validate a results directory against guide/01-result-format.md.
 
+Prints the file inventory first (guide/00-file-inventory.md) - 14 result files,
+6 required and 8 optional in 4 all-or-none feature groups - then checks the
+grammar and the cross-file invariants of whatever is present.
+
 usage: python validate_results.py <run-dir> [--names cluster|group]
 """
 import re, sys
@@ -12,11 +16,36 @@ PCT  = re.compile(r"^\d+(\.\d+)?%$")
 NAMES = {
     "group":   dict(rate_ns="group_rate_ns.log", rate="group_rate.log",
                     util_g="utilization_group.log", lat="latency_group.log",
-                    free_g="free_time_group.log"),
+                    free_g="free_time_group.log", ev="events_ns.log"),
     "cluster": dict(rate_ns="fps_cluster_ns.log", rate="fps_cluster.log",
                     util_g="utilization_cluster.log", lat="latency_cluster.log",
-                    free_g="free_time_cluster.log"),
+                    free_g="free_time_cluster.log", ev="cut_change_ns.log"),
 }
+
+# The full inventory of guide/00-file-inventory.md, in its numbering.
+# (number, key-or-literal-filename, feature group, what the file measures)
+MANIFEST = [
+    ( 1, "batch_done_ns.log", "core",     "system throughput series"),
+    ( 2, "@rate_ns",          "core",     "per-group throughput series"),
+    ( 3, "@rate",             "core",     "throughput summary"),
+    ( 4, "utilization.log",   "core",     "per-device busy ratio"),
+    ( 5, "@util_g",           "core",     "utilization rolled up"),
+    ( 6, "@lat",              "core",     "latency distributions"),
+    ( 7, "@ev",               "events",   "control-plane events"),
+    ( 8, "free_time.log",     "freetime", "per-device idle time"),
+    ( 9, "@free_g",           "freetime", "free time rolled up"),
+    (10, "free_time_series.log",     "freetime", "free time over the run"),
+    (11, "broker_ram_ns.log",        "infraram", "infra-host RAM series"),
+    (12, "broker_ram.log",           "infraram", "infra-host RAM summary"),
+    (13, "message_size.log",         "msgsize",  "payload size summary"),
+    (14, "message_size_series.log",  "msgsize",  "payload size over the run"),
+]
+
+# Optional features are all-or-none (00 section 5). "events" is a single file, so it has
+# nothing to be inconsistent with.
+GROUPS = {"freetime": "free time (00, files 8-10)",
+          "infraram": "infrastructure-host RAM (00, files 11-12)",
+          "msgsize":  "message size (00, files 13-14)"}
 
 def lines(p):
     if not p.exists():
@@ -27,18 +56,67 @@ def lines(p):
 def num(v):
     return float(str(v).rstrip("%"))
 
+def inventory(d, N, scheme, errs, warns):
+    """Report every file of the manifest as ok / empty / missing, and enforce the
+    all-or-none rule on the optional feature groups. Returns nothing; the
+    line-level checks below read the files again through lines()."""
+    rows, seen = [], {}
+    for n, key, group, what in MANIFEST:
+        name = N[key[1:]] if key.startswith("@") else key
+        ls = lines(d / name)
+        # events has two conformant names; accept whichever this project uses.
+        if ls is None and group == "events":
+            alt = [v for v in ("events_ns.log", "cut_change_ns.log") if v != name]
+            for a in alt:
+                if (d / a).exists():
+                    name, ls = a, lines(d / a)
+                    break
+        state = "MISS" if ls is None else ("EMPTY" if not ls else "ok")
+        seen[(n, group)] = state
+        rows.append((n, name, group, what, state, 0 if not ls else len(ls)))
+
+    print(f"\ninventory  {d}  (naming scheme: {scheme})")
+    for n, name, group, what, state, cnt in rows:
+        tag = {"ok": "[ ok  ]", "EMPTY": "[EMPTY]", "MISS": "[MISS ]"}[state]
+        detail = f"{cnt} lines" if state == "ok" else (
+            "present, 0 lines" if state == "EMPTY" else "not present")
+        req = "required" if group == "core" else "optional"
+        print(f"  {tag} {n:>2}  {name:<26} {detail:<16} {req:<8} {what}")
+
+    have = sum(1 for r in rows if r[4] != "MISS")
+    core = sum(1 for r in rows if r[2] == "core" and r[4] != "MISS")
+    print(f"\n  {have}/14 result files present, {core}/6 required "
+          f"(see guide/00-file-inventory.md)")
+
+    for n, name, group, what, state, cnt in rows:
+        if group == "core" and state == "MISS":
+            errs.append(f"{name}: MISSING (required, file {n} of 14; see guide/00-file-inventory.md)")
+        elif group == "core" and state == "EMPTY":
+            errs.append(f"{name}: present but empty (required file {n} produced no rows)")
+
+    for group, label in GROUPS.items():
+        states = {n: s for (n, g), s in seen.items() if g == group}
+        present = [n for n, s in states.items() if s != "MISS"]
+        if present and len(present) != len(states):
+            missing = sorted(n for n, s in states.items() if s == "MISS")
+            errs.append(f"{label}: files {sorted(present)} present but "
+                        f"{missing} missing - a feature is all its files or none")
+
+    if not (d / "config.yaml").exists():
+        warns.append("config.yaml: not archived beside the results - the numbers are "
+                     "unreadable in a month without it (see guide/05-archiving.md)")
+
 def main(run_dir, scheme):
     d, N = Path(run_dir), NAMES[scheme]
     errs, warns = [], []
+
+    inventory(d, N, scheme, errs, warns)
 
     required = ["batch_done_ns.log", N["rate_ns"], N["rate"],
                 "utilization.log", N["util_g"], N["lat"]]
     files = {}
     for name in required:
-        ls = lines(d / name)
-        if ls is None:
-            errs.append(f"{name}: MISSING (required)")
-        files[name] = ls or []
+        files[name] = lines(d / name) or []
 
     # -- grammar: every line starts with a 19-digit ns timestamp -------------
     for name, ls in files.items():
@@ -142,14 +220,10 @@ def main(run_dir, scheme):
         if kv["kind"] == "e2e" and "role" in kv:
             errs.append(f"{N['lat']}:{i}: e2e lines must not carry role=")
 
-    # -- free time (01 §3.8-3.10): optional, but all three or none ----------
+    # -- free time (01 3.8-3.10): optional. Presence and the all-or-none rule
+    # are enforced by inventory(); what follows checks the lines themselves.
     ft = {name: lines(d / name) for name in
           ("free_time.log", N["free_g"], "free_time_series.log")}
-    present = [n for n, ls in ft.items() if ls is not None]
-    if present and len(present) != 3:
-        errs.append(f"free time: {', '.join(present)} present but "
-                    f"{', '.join(n for n in ft if n not in present)} missing "
-                    f"(files 8-10 are one feature: emit all three or none)")
     for name, ls in ft.items():
         for i, ln in enumerate(ls or [], 1):
             if not TS.match(ln):

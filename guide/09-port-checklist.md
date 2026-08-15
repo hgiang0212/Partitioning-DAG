@@ -4,6 +4,43 @@ Work top to bottom. Every item is testable — no item says "make sure it's good
 
 ---
 
+## Phase 0 · The file manifest — do this before writing any code
+
+A port fails most often by **omission**, not by malformed output: the measurements someone
+noticed got implemented, and nobody ever held a list of the ones they did not. Hold the
+list first. Full detail per file — what it measures, what breaks without it — is
+[00-file-inventory.md](00-file-inventory.md).
+
+**14 result files: 6 required, 8 optional in 4 all-or-none groups, + `config.yaml`.**
+
+| # | File | Measures | Status |
+|---|---|---|---|
+| 1 | `batch_done_ns.log` | when every unit finished, system-wide | ☐ required |
+| 2 | `group_rate_ns.log` | the same, split by group | ☐ required |
+| 3 | `group_rate.log` | how fast the run was | ☐ required |
+| 4 | `utilization.log` | what fraction each device was busy | ☐ required |
+| 5 | `utilization_group.log` | the same, rolled up | ☐ required |
+| 6 | `latency_group.log` | how long a unit takes, and where the time goes | ☐ required |
+| 7 | `events_ns.log` | when control decisions changed something | ☐ port / ☐ skip |
+| 8–10 | `free_time*.log` | how much of the fleet did nothing, and when, and why | ☐ port / ☐ skip |
+| 11–12 | `broker_ram*.log` | what the run cost the infrastructure host | ☐ port / ☐ skip |
+| 13–14 | `message_size*.log` | how many bytes a worker puts on the wire | ☐ port / ☐ skip |
+| — | `config.yaml` | the settings behind every number above | ☐ required |
+
+- [ ] Every optional group above is marked **port** or **skip** — explicitly, before
+      implementation starts. An unmarked group is the one that goes missing
+- [ ] A group marked **skip** is skipped **whole**. Never one file of two, or two of three
+- [ ] Naming scheme chosen and written down: `group` ☐ / `cluster` ☐ — five files have two
+      conformant names and mixing them yields a complete directory that reads as five
+      missing files ([00 §4](00-file-inventory.md))
+- [ ] Side-car files planned too — each device's own timing, free-time and message-size
+      logs, and per-unit CSVs ([00 §6](00-file-inventory.md)). They are not results, but
+      they are the only per-device record and they have their own startup rules
+- [ ] Build order agreed: files 1–3, then 4–5, then 6, then archive, then the optional
+      features ([00 §10](00-file-inventory.md)). Not all fourteen at once
+
+---
+
 ## Phase 1 · Map your project onto the guide
 
 - [ ] Filled in the terminology table from [README](README.md) — what is a **unit**, a
@@ -159,6 +196,10 @@ all its files or none ([01 §2](01-result-format.md)).
 python guide/validate_results.py <run-dir> --names <scheme>
 ```
 
+- [ ] The inventory header reads **`N/14 result files present, 6/6 required`**, and `N`
+      matches the groups you marked **port** in Phase 0 — not fewer, and for a reason you
+      can name, not a shrug
+- [ ] Same check run on the **archive**, not only the live log directory
 - [ ] **Exit code 0, zero errors**, on every run directory
 - [ ] Ran the negative test: corrupt a copy and confirm the validator catches it
 - [ ] Line counts match between `batch_done_ns.log` and `group_rate_ns.log`
@@ -211,6 +252,8 @@ Delivery
 
 A port is done when all of these hold:
 
+0. Every file in the Phase 0 manifest is either **present** or **deliberately skipped as a
+   whole feature**, and the validator's inventory line agrees with the Phase 0 marks.
 1. `validate_results.py` exits 0 on a fresh run directory.
 2. The console summary is byte-identical in shape to
    [02 §7](02-throughput.md) — same labels, same column alignment.
@@ -231,6 +274,11 @@ Point 6 is the whole purpose of this guide. If it fails, something in Phase 2–
 
 | # | Failure | Caught by |
 |---|---|---|
+| 0a | **Files simply never implemented** — the port covers what someone noticed | validator inventory: `N/14 present` |
+| 0b | **Naming schemes mixed** → 5 files "missing", 5 unexpected | validator inventory + `--names` ([00 §4](00-file-inventory.md)) |
+| 0c | **Half a feature ported** — summary without series, or the reverse | validator: all-or-none group check |
+| 0d | Optional feature off, and nobody wrote down that it was off | archived `config.yaml` |
+| 0e | Shutdown collection hung → live files present, summaries missing | validator inventory: required files `MISS` |
 | 1 | Two stages publish per unit → rate 2× real | validator: group `done` > `SYSTEM` |
 | 2 | Column named `agg`/`max`/`count` → silent empty filter | chart missing a series |
 | 3 | Publishing from a non-channel thread | random broker errors |
